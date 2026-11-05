@@ -39,7 +39,10 @@ SUPPORTED_VERSIONS = {12, 24}
 STILL_MOTION = 0.05      # mean per-second |Δgravity| (g, L1) below this = a "still" minute
 MIN_WORN_SAMPLES = 20    # minute needs this many HR>0 seconds to count as worn
 MERGE_GAP_MIN = 20       # restless gaps up to this long stay inside one sleep window
-MIN_SLEEP_MIN = 30       # shorter still-and-calm runs are not called sleep
+MIN_SLEEP_MIN = 60       # shorter still-and-calm runs are not called sleep (sitting still ≠ sleep)
+CALM_MARGIN_BPM = 5      # "calm" = at least this far below the awake (moving) reference HR
+MIN_ASLEEP_FRAC = 0.6    # a window must be mostly still-and-calm minutes
+DEMO_END = 1577876400    # 2020-01-01 07:00 EST — demo night is pinned far from real data
 
 
 @dataclass
@@ -103,6 +106,11 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
             "SELECT hex FROM frames WHERE device_id=? AND inner_type=? AND unix BETWEEN ? AND ? ORDER BY unix",
             (dev[0], TYPE_HISTORICAL, since, until)).fetchall()
         last = conn.execute("SELECT max(recv_ms) FROM frames WHERE device_id=?", (dev[0],)).fetchone()[0]
+        try:   # ground-truth labels written by `whoop_sync.py label` (e.g. activity=awake)
+            labels = conn.execute("SELECT start_unix,end_unix,activity FROM labels WHERE device_id=? "
+                                  "AND end_unix>=? AND start_unix<=?", (dev[0], since, until)).fetchall()
+        except sqlite3.OperationalError:
+            labels = []
     finally:
         conn.close()
     seen, out = set(), []
@@ -112,7 +120,7 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
             seen.add(s.unix)
             out.append(s)
     out.sort(key=lambda s: s.unix)
-    return out, {"address": dev[1], "name": dev[2], "last_sync": (last or 0) // 1000}
+    return out, {"address": dev[1], "name": dev[2], "last_sync": (last or 0) // 1000, "labels": labels}
 
 
 def per_minute(samples: list[Sample]) -> list[Minute]:
@@ -132,8 +140,11 @@ def per_minute(samples: list[Sample]) -> list[Minute]:
     return mins
 
 
-def detect_sleep(mins: list[Minute]) -> list[SleepWindow]:
-    """Approximate sleep: worn + still + HR below the awake (moving) reference, merged over short gaps."""
+def detect_sleep(mins: list[Minute], labels: list[tuple[int, int, str]] = ()) -> list[SleepWindow]:
+    """Approximate sleep: worn + still + HR well below the awake (moving) reference, merged over short
+    gaps; windows must be ≥MIN_SLEEP_MIN long and mostly still-and-calm. Minutes inside an `awake`
+    label (NOOP labels table) are never sleep."""
+    awake = [(a, b) for a, b, act in labels if act.lower() in ("awake", "wake")]
     worn = [m for m in mins if m.n >= MIN_WORN_SAMPLES and m.hr]
     if not worn:
         return []
@@ -141,7 +152,8 @@ def detect_sleep(mins: list[Minute]) -> list[SleepWindow]:
     # reference "awake" HR: median of moving minutes; fallback when we barely saw him move
     hr_ref = st.median(active) if len(active) >= 10 else sorted(m.hr for m in worn)[int(len(worn) * 0.9)]
     for m in mins:
-        m.asleep = m in worn and m.motion < STILL_MOTION and m.hr < hr_ref
+        m.asleep = (m in worn and m.motion < STILL_MOTION and m.hr <= hr_ref - CALM_MARGIN_BPM
+                    and not any(a <= m.t < b for a, b in awake))
     windows: list[SleepWindow] = []
     cur: SleepWindow | None = None
     for m in (m for m in mins if m.asleep):
@@ -153,7 +165,7 @@ def detect_sleep(mins: list[Minute]) -> list[SleepWindow]:
     keep = []
     for w in windows:
         w.minutes = [m for m in mins if w.start <= m.t < w.end]
-        if w.span_min >= MIN_SLEEP_MIN:
+        if w.span_min >= MIN_SLEEP_MIN and w.asleep_min >= MIN_ASLEEP_FRAC * w.span_min:
             keep.append(w)
     return keep
 
@@ -203,16 +215,16 @@ def demo_samples(end: int) -> list[Sample]:
 
 def build_report(db: Path, hours: float, address: str | None, now: int | None = None,
                  demo: bool = False) -> Report:
-    until = now or int(time.time())
+    until = now or (DEMO_END if demo else int(time.time()))
     since = until - int(hours * 3600)
-    if demo:
+    if demo:   # pinned to a 2020 date so it can never be mistaken for the wearer's own night
         samples = [s for s in demo_samples(until) if s.unix >= since]
         mins = per_minute(samples)
-        return Report({"address": "-", "name": "DEMO (synthetic data)", "last_sync": until},
-                      since, until, samples, mins, detect_sleep(mins))
+        return Report({"address": "-", "name": "DEMO — synthetic data, NOT your night", "last_sync": until,
+                       "labels": []}, since, until, samples, mins, detect_sleep(mins))
     samples, meta = load_samples(db, since, until + 300, address)
     mins = per_minute(samples)
-    return Report(meta, since, until, samples, mins, detect_sleep(mins))
+    return Report(meta, since, until, samples, mins, detect_sleep(mins, meta["labels"]))
 
 
 # ------------------------------------------------------------------------------------- formatting
@@ -300,6 +312,10 @@ def text_lines(r: Report, width: int = 80) -> list[tuple[str, str]]:
 # ------------------------------------------------------------------------------------------ HTML
 def render_html(r: Report, refresh: int | None = None) -> str:
     e = html.escape
+    # Every clock time carries its unix ts in data-t; the inline script re-renders it in the BROWSER's
+    # timezone. The server-side text (this machine's local zone) is only the no-JS fallback.
+    T = lambda t, f="hm": f'<time data-t="{int(t)}" data-f="{f}">{e(hhmm(int(t)) if f == "hm" else stamp(int(t)))}</time>'
+    local_tz = datetime.now().astimezone().tzname() or "local"
     hm, stats, now = r.hr_minutes, r.hr_stats(), r.hr_now
     W, H, PAD = 900, 260, 36
     svg = '<p class="dim">No heart-rate data in this window yet.</p>'
@@ -311,7 +327,7 @@ def render_html(r: Report, refresh: int | None = None) -> str:
         x = lambda t: PAD + (t - t0) / max(1, t1 - t0) * (W - 2 * PAD)
         y = lambda v: H - PAD - (v - lo) / max(1, hi - lo) * (H - 2 * PAD)
         bands = "".join(f'<rect class="band" x="{x(s.start):.1f}" y="{PAD}" width="{x(s.end) - x(s.start):.1f}" '
-                        f'height="{H - 2 * PAD}"><title>approx. sleep {hhmm(s.start)}–{hhmm(s.end)}</title></rect>'
+                        f'height="{H - 2 * PAD}"><title data-range="{s.start},{s.end}">approx. sleep {hhmm(s.start)}–{hhmm(s.end)}</title></rect>'
                         for s in r.sleep)
         segs, cur, prev = [], [], None
         for m in hm:                                      # break the line across gaps > 5 min
@@ -329,25 +345,25 @@ def render_html(r: Report, refresh: int | None = None) -> str:
                       f'<text class="ax" x="{PAD - 6}" y="{y(v) + 4:.1f}" text-anchor="end">{v:.0f}</text>')
         for i in range(5):
             t = t0 + (t1 - t0) * i / 4
-            ticks += f'<text class="ax" x="{x(t):.1f}" y="{H - PAD + 18}" text-anchor="middle">{hhmm(int(t))}</text>'
+            ticks += f'<text class="ax" x="{x(t):.1f}" y="{H - PAD + 18}" text-anchor="middle" data-t="{int(t)}" data-f="hm">{hhmm(int(t))}</text>'
         svg = (f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="Heart rate per minute">'
                f'{bands}{ticks}{lines}{dots}</svg>')
 
-    def tile(label, value, unit="", note=""):
+    def tile(label, value, unit="", note="", note_html=None):
         return (f'<div class="tile"><div class="lbl">{e(label)}</div><div class="val">{e(value)}'
-                f'<span class="unit">{e(unit)}</span></div><div class="dim">{e(note)}</div></div>')
+                f'<span class="unit">{e(unit)}</span></div><div class="dim">{note_html or e(note)}</div></div>')
 
     tiles = ""
     if now and stats:
-        tiles = (tile("Latest HR", f"{now.hr}", " bpm", f"{hhmm(now.unix)} · {ago(now.unix)}")
+        tiles = (tile("Latest HR", f"{now.hr}", " bpm", note_html=f"{T(now.unix)} · {e(ago(now.unix))}")
                  + tile("Resting HR ≈", f"{stats['rest']:.0f}", " bpm", "5th pct of still minutes")
                  + tile("Range", f"{stats['min']:.0f}–{stats['max']:.0f}", " bpm", f"avg {stats['avg']:.0f}")
                  + tile("Worn", dur(stats["worn_min"]), "", f"last {(r.until - r.since) // 3600}h"))
     sleep_rows = "".join(
-        f"<tr><td>{e(stamp(s.start))} → {hhmm(s.end)}</td><td>{dur(s.span_min)}</td><td>{dur(s.asleep_min)}</td>"
+        f"<tr><td>{T(s.start, 'stamp')} → {T(s.end)}</td><td>{dur(s.span_min)}</td><td>{dur(s.asleep_min)}</td>"
         f"<td>{(st.mean(s.hrs) if s.hrs else 0):.0f}</td><td>{(min(s.hrs) if s.hrs else 0):.0f}</td></tr>"
         for s in reversed(r.sleep))
-    sleep_html = (f'<table><tr><th>Window</th><th>In bed</th><th>Asleep ≈</th><th>Avg HR</th><th>Low HR</th></tr>'
+    sleep_html = (f'<table><tr><th>Window <span class="tz">{e(local_tz)}</span></th><th>In bed</th><th>Asleep ≈</th><th>Avg HR</th><th>Low HR</th></tr>'
                   f'{sleep_rows}</table>' if r.sleep else
                   f'<p class="dim">No sleep window detected yet. It needs at least {MIN_SLEEP_MIN} minutes of the '
                   f'strap being still with calm heart rate. Wear it overnight, then sync.</p>')
@@ -373,13 +389,33 @@ table{{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}}
 th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}} th{{color:var(--dim);font-weight:500;font-size:13px}}
 </style></head><body><main>
 <h1>Whoop PoC · {e(r.meta.get('name') or r.meta['address'])}</h1>
-<div class="dim">Last {(r.until - r.since) // 3600}h · last sync {e(stamp(r.meta['last_sync']))} · generated {e(stamp(int(time.time())))}</div>
+<div class="dim">Last {(r.until - r.since) // 3600}h · last sync {T(r.meta['last_sync'], 'stamp')} · generated {T(time.time(), 'stamp')} · times shown in <span class="tz">{e(local_tz)}</span></div>
 <div class="tiles">{tiles}</div>
 <h2>Heart rate (per-minute average)</h2><div class="card">{svg}
-<div class="dim">Shaded areas are approximate sleep windows.</div></div>
+<div class="dim">Time axis: <span class="tz">{e(local_tz)}</span>. Shaded areas are approximate sleep windows.</div></div>
 <h2>Sleep <span class="dim">(approximate: motion + HR heuristic, not WHOOP sleep staging)</span></h2>
 <div class="card">{sleep_html}</div>
-</main></body></html>"""
+</main>
+<script>
+(() => {{
+  const fmt = {{hm: {{hour: "2-digit", minute: "2-digit", hour12: false}},
+               stamp: {{weekday: "short", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false}}}};
+  const f = (t, k) => new Date(t * 1000).toLocaleString(undefined, fmt[k] || fmt.hm);
+  document.querySelectorAll("[data-t]").forEach(el => el.textContent = f(+el.dataset.t, el.dataset.f));
+  document.querySelectorAll("[data-range]").forEach(el => {{
+    const [a, b] = el.dataset.range.split(",");
+    el.textContent = `approx. sleep ${{f(+a, "hm")}}–${{f(+b, "hm")}}`;
+  }});
+  // zone label: IANA name + abbreviation(s) for the times actually on the page (EST vs EDT across DST)
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const abbr = t => new Intl.DateTimeFormat(undefined, {{timeZoneName: "short"}})
+      .formatToParts(new Date(t * 1000)).find(p => p.type === "timeZoneName")?.value;
+  const ts = [...document.querySelectorAll("[data-t]")].map(el => +el.dataset.t);
+  const abbrs = [...new Set(ts.map(abbr))].filter(Boolean).join("/");
+  document.querySelectorAll(".tz").forEach(el => el.textContent = abbrs ? `${{zone}} (${{abbrs}})` : zone);
+}})();
+</script>
+</body></html>"""
 
 
 def run_html(args) -> None:

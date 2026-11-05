@@ -42,6 +42,26 @@ class Sleep(unittest.TestCase):
         awake = [s for s in w.demo_samples(self.END) if s.unix < self.END - 8 * 3600]
         self.assertEqual(w.detect_sleep(w.per_minute(awake)), [])
 
+    def test_still_evening_wear_is_not_sleep(self):
+        # 50 min sitting still at a desk, HR only slightly below a short active stretch -> not sleep
+        import random
+        rnd, out, t0 = random.Random(1), [], self.END - 3 * 3600
+        for i in range(15 * 60):                      # 15 min moving, HR ~72
+            out.append(w.Sample(t0 + i, 72 + int(rnd.gauss(0, 2)), 0.1 + rnd.gauss(0, .2), -0.4, 0.9))
+        for i in range(15 * 60, 65 * 60):             # 50 min still, HR ~66
+            out.append(w.Sample(t0 + i, 66 + int(rnd.gauss(0, 1.5)), 0.1, -0.4, 0.91))
+        self.assertEqual(w.detect_sleep(w.per_minute(out)), [])
+
+    def test_awake_label_overrides(self):
+        samples = w.demo_samples(self.END)
+        lab = [(self.END - 9 * 3600, self.END, "awake")]
+        self.assertEqual(w.detect_sleep(w.per_minute(samples), lab), [])
+
+    def test_demo_is_pinned_far_from_now(self):
+        r = w.build_report(None, 24, None, demo=True)
+        self.assertLess(r.until, 1600000000)
+        self.assertIn("NOT your night", r.meta["name"])
+
     def test_renderers(self):
         r = w.build_report(None, 24, None, now=self.END, demo=True)
         self.assertIn("asleep", "\n".join(t for _, t in w.text_lines(r, 100)))

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import statistics as st
 import time
+from datetime import datetime
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -79,7 +80,8 @@ class WhoopApp(App):
         self.sub_title = r.meta.get("name") or r.meta["address"]
         self.query_one("#meta", Static).update(
             f"window: last {(r.until - r.since) // 3600}h · last sync {core.stamp(r.meta['last_sync'])} "
-            f"({core.ago(r.meta['last_sync'])}) · auto-reload {self.args.refresh}s")
+            f"({core.ago(r.meta['last_sync'])}) · auto-reload {self.args.refresh}s · "
+            f"times in {datetime.now().astimezone().tzname()}")
 
         now, stats, hm = r.hr_now, r.hr_stats(), r.hr_minutes
         t = {k: self.query_one(f"#t-{k}", Tile) for k in ("now", "rest", "range", "worn")}
