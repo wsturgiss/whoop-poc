@@ -50,8 +50,7 @@ class WhoopApp(App):
                     yield Tile(id=f"t-{i}")
             yield Sparkline([], id="hr-spark", summary_function=max)
             yield Static(id="hr-axis")
-            yield Static("SLEEP  [dim](approximate: motion + HR heuristic, not WHOOP sleep staging)[/]",
-                         classes="h")
+            yield Static("SLEEP", id="sleep-head", classes="h")
             yield Static(id="sleep-note")
             yield DataTable(id="sleep-table", cursor_type="row", zebra_stripes=True)
             with Vertical():
@@ -60,7 +59,6 @@ class WhoopApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("Window", "In bed", "Asleep ≈", "Eff.", "Avg HR", "Low HR")
         self.action_reload()
         self.set_interval(self.args.refresh, self.action_reload)
 
@@ -100,12 +98,16 @@ class WhoopApp(App):
             spark.data = []
             axis.update("no heart-rate data in this window — wear the strap, then press s to sync")
 
+        staged = r.meta.get("sleep_source") == "noop"
+        self.query_one("#sleep-head", Static).update(
+            f"SLEEP  [dim]{core.SLEEP_SOURCE_LABEL[r.meta.get('sleep_source', 'heuristic')]}[/]")
         table = self.query_one(DataTable)
-        table.clear()
+        table.clear(columns=True)
+        table.add_columns("Window", "In bed", "Asleep ≈", "Eff.", "Avg HR", "Low HR",
+                          *(("Deep", "Light", "REM", "Wake", "Rest HR", "HRV") if staged else ()))
         note, hyp, legend = (self.query_one(f"#{i}", Static) for i in ("sleep-note", "hypno", "hypno-legend"))
         if not r.sleep:
-            note.update(f"No sleep window detected yet (needs ≥{core.MIN_SLEEP_MIN} min still + calm HR). "
-                        "Wear it overnight, then sync.")
+            note.update(core.no_sleep_msg(r))
             hyp.update("")
             legend.update("")
             table.display = False
@@ -116,14 +118,22 @@ class WhoopApp(App):
             hrs = s.hrs
             table.add_row(f"{core.stamp(s.start)} → {core.hhmm(s.end)}", core.dur(s.span_min),
                           core.dur(s.asleep_min), f"{100 * s.asleep_min / max(1, s.span_min):.0f}%",
-                          f"{st.mean(hrs):.0f}" if hrs else "—", f"{min(hrs):.0f}" if hrs else "—")
+                          f"{st.mean(hrs):.0f}" if hrs else "—", f"{min(hrs):.0f}" if hrs else "—",
+                          *((*(core.dur(v) for v in (lambda m: (m["deep"], m["light"], m["rem"], m["wake"]))(
+                              s.stage_minutes())), str(s.resting_hr or "—"),
+                             f"{s.avg_hrv:.0f} ms" if s.avg_hrv else "—") if staged else ()))
         last = r.sleep[-1]
         width = max(20, self.size.width - 8)
-        bins = core.bucket(last.minutes, last.start, last.end, width)
-        bar = "".join(" " if not b else "█" if sum(m.asleep for m in b) * 2 >= len(b) else "[dim]░[/]"
-                      for b in bins)
+        if staged:
+            bar = core.stage_bar(last, width, markup=True)
+            legend_txt = "   ".join(f"[{core.STAGE_COLOR[k]}]{core.STAGE_CHAR[k]}[/] {k}" for k in core.STAGES)
+        else:
+            bins = core.bucket(last.minutes, last.start, last.end, width)
+            bar = "".join(" " if not b else "█" if sum(m.asleep for m in b) * 2 >= len(b) else "[dim]░[/]"
+                          for b in bins)
+            legend_txt = "█ still + calm HR (≈asleep)   ░ restless / awake"
         hyp.update(f"latest window  {core.hhmm(last.start)} → {core.hhmm(last.end)}\n{bar}")
-        legend.update("█ still + calm HR (≈asleep)   ░ restless / awake")
+        legend.update(legend_txt)
 
 
 def run_tui(args) -> None:

@@ -42,6 +42,8 @@ MERGE_GAP_MIN = 20       # restless gaps up to this long stay inside one sleep w
 MIN_SLEEP_MIN = 60       # shorter still-and-calm runs are not called sleep (sitting still ≠ sleep)
 CALM_MARGIN_BPM = 5      # "calm" = at least this far below the awake (moving) reference HR
 MIN_ASLEEP_FRAC = 0.6    # a window must be mostly still-and-calm minutes
+STAGES = ("wake", "rem", "light", "deep")   # display order, top → bottom
+STAGER_BIN = Path(os.environ.get("WHOOP_STAGE", Path(__file__).resolve().parent / "stager/.build/release/whoop-stage"))
 DEMO_END = 1577876400    # 2020-01-01 07:00 EST — demo night is pinned far from real data
 
 
@@ -68,17 +70,34 @@ class SleepWindow:
     start: int
     end: int                    # exclusive, unix
     minutes: list[Minute] = field(default_factory=list)
+    stages: list[dict] | None = None      # NOOP SleepStager segments: {start,end,stage}
+    resting_hr: int | None = None         # NOOP: lowest 5-min rolling HR
+    avg_hrv: float | None = None          # NOOP: mean RMSSD (ms)
 
     @property
     def span_min(self) -> int:
         return (self.end - self.start) // 60
 
+    def stage_at(self, t: int) -> str | None:
+        return next((g["stage"] for g in self.stages or () if g["start"] <= t < g["end"]), None)
+
+    def stage_minutes(self) -> dict[str, int]:
+        out = {k: 0 for k in STAGES}
+        for g in self.stages or ():
+            out[g["stage"]] = out.get(g["stage"], 0) + (g["end"] - g["start"]) // 60
+        return out
+
     @property
     def asleep_min(self) -> int:
+        if self.stages is not None:
+            sm = self.stage_minutes()
+            return sum(v for k, v in sm.items() if k != "wake")
         return sum(m.asleep for m in self.minutes)
 
     @property
     def hrs(self) -> list[float]:
+        if self.stages is not None:
+            return [m.hr for m in self.minutes if m.hr and self.stage_at(m.t + 30) not in (None, "wake")]
         return [m.hr for m in self.minutes if m.asleep and m.hr]
 
 
@@ -213,22 +232,112 @@ def demo_samples(end: int) -> list[Sample]:
     return out
 
 
+def noop_stage(db: Path, since: int, until: int, address: str | None, mins: list[Minute],
+               labels=()) -> list[SleepWindow] | None:
+    """Run NOOP's SleepStager (via stager/whoop-stage) on NOOP's decoded feat_* tables.
+    None = stager not built / no decoded data (caller falls back to the heuristic)."""
+    if not STAGER_BIN.exists():
+        return None
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
+                           + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
+        sec = conn.execute("SELECT unix,hr,gx,gy,gz,resp_raw FROM feat_second WHERE device_id=? "
+                           "AND unix BETWEEN ? AND ? ORDER BY unix", (dev[0], since, until)).fetchall()
+        rr = conn.execute("SELECT unix,rr_ms FROM feat_rr WHERE device_id=? AND unix BETWEEN ? AND ? "
+                          "ORDER BY unix,idx", (dev[0], since, until)).fetchall()
+    except sqlite3.OperationalError:     # NOOP decode never ran on this DB
+        return None
+    finally:
+        conn.close()
+    if not sec:
+        return None
+    return run_stager({
+        "hr": [{"ts": u, "bpm": h} for u, h, *_ in sec if h],
+        "gravity": [{"ts": u, "x": x, "y": y, "z": z} for u, _, x, y, z, _ in sec if x is not None],
+        "resp": [{"ts": u, "raw": r} for u, *_, r in sec if r is not None],
+        "rr": [{"ts": u, "rrMs": v} for u, v in rr],
+        "tzOffsetSeconds": int(datetime.fromtimestamp(until).astimezone().utcoffset().total_seconds()),
+    }, mins, labels)
+
+
+def run_stager(payload: dict, mins: list[Minute], labels=()) -> list[SleepWindow] | None:
+    import json
+    if not STAGER_BIN.exists():
+        return None
+    res = subprocess.run([str(STAGER_BIN)], input=json.dumps(payload), capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"whoop-stage failed: {res.stderr.strip()[:200]}", file=sys.stderr)
+        return None
+    awake = [(a, b) for a, b, act in labels if act.lower() in ("awake", "wake")]
+    out = []
+    for s in json.loads(res.stdout):
+        span = max(1, s["end"] - s["start"])
+        covered = sum(max(0, min(b, s["end"]) - max(a, s["start"])) for a, b in awake)
+        if covered * 2 > span:          # ground truth says he was awake for most of it
+            continue
+        out.append(SleepWindow(s["start"], s["end"], [m for m in mins if s["start"] <= m.t < s["end"]],
+                               stages=s["stages"], resting_hr=s.get("restingHR"), avg_hrv=s.get("avgHRV")))
+    return out
+
+
+def demo_payload(samples: list[Sample]) -> dict:
+    """Stager input for the synthetic night: HR + gravity + made-up beat intervals (≈1/s)."""
+    import random
+    rnd = random.Random(7)
+    rr = [{"ts": x.unix, "rrMs": int(60000 / max(x.hr, 30) + rnd.gauss(0, 25 if x.hr < 62 else 8))}
+          for x in samples if x.hr]
+    return {"hr": [{"ts": x.unix, "bpm": x.hr} for x in samples if x.hr],
+            "gravity": [{"ts": x.unix, "x": x.gx, "y": x.gy, "z": x.gz} for x in samples],
+            "rr": rr, "resp": [], "tzOffsetSeconds": -18000}
+
+
 def build_report(db: Path, hours: float, address: str | None, now: int | None = None,
-                 demo: bool = False) -> Report:
+                 demo: bool = False, heuristic: bool = False) -> Report:
     until = now or (DEMO_END if demo else int(time.time()))
     since = until - int(hours * 3600)
     if demo:   # pinned to a 2020 date so it can never be mistaken for the wearer's own night
         samples = [s for s in demo_samples(until) if s.unix >= since]
         mins = per_minute(samples)
+        staged = None if heuristic else run_stager(demo_payload(samples), mins)
         return Report({"address": "-", "name": "DEMO — synthetic data, NOT your night", "last_sync": until,
-                       "labels": []}, since, until, samples, mins, detect_sleep(mins))
+                       "labels": [], "sleep_source": "noop" if staged is not None else "heuristic"},
+                      since, until, samples, mins, staged if staged is not None else detect_sleep(mins))
     samples, meta = load_samples(db, since, until + 300, address)
     mins = per_minute(samples)
-    return Report(meta, since, until, samples, mins, detect_sleep(mins, meta["labels"]))
+    staged = None if heuristic else noop_stage(db, since, until + 300, address, mins, meta["labels"])
+    meta["sleep_source"] = "noop" if staged is not None else "heuristic"
+    sleep = staged if staged is not None else detect_sleep(mins, meta["labels"])
+    return Report(meta, since, until, samples, mins, sleep)
 
 
 # ------------------------------------------------------------------------------------- formatting
 SPARK = "▁▂▃▄▅▆▇█"
+SLEEP_SOURCE_LABEL = {
+    "noop": "(NOOP SleepStager: approximate 4-stage, not PSG-validated)",
+    "heuristic": "(approximate: motion + HR heuristic, not WHOOP staging)",
+}
+STAGE_CHAR = {"wake": "·", "rem": "▃", "light": "▅", "deep": "█"}
+STAGE_COLOR = {"wake": "#f59e0b", "rem": "#a855f7", "light": "#38bdf8", "deep": "#2563eb"}
+
+
+def no_sleep_msg(r: "Report") -> str:
+    if not any(m.n for m in r.minutes):
+        return "No sleep yet: no worn data in this window."
+    if r.meta.get("sleep_source") == "noop":
+        return "No sleep session yet: NOOP's stager hasn't found an in-bed stretch. Wear it overnight, then sync."
+    return f"No sleep window yet: needs ≥{MIN_SLEEP_MIN} min still with calm HR. Wear it overnight, then sync."
+
+
+def stage_bar(s: "SleepWindow", width: int, markup: bool = False) -> str:
+    """One character per time bucket, showing the stage at the bucket's midpoint."""
+    step = max(1, (s.end - s.start) / max(1, width))
+    out = []
+    for i in range(width):
+        st_ = s.stage_at(int(s.start + (i + 0.5) * step))
+        ch = STAGE_CHAR.get(st_, " ")
+        out.append(f"[{STAGE_COLOR[st_]}]{ch}[/]" if markup and st_ else ch)
+    return "".join(out)
 
 
 def hhmm(t: int) -> str:
@@ -291,10 +400,9 @@ def text_lines(r: Report, width: int = 80) -> list[tuple[str, str]]:
         L.append(("dim", f"  {hhmm(t0)}{'':{max(1, cols - 10)}}{hhmm(t1)}   ({lo:.0f}–{hi:.0f} bpm)"))
     L.append(("", ""))
 
-    L.append(("head", " SLEEP  (approximate: motion + HR heuristic, not WHOOP staging)"))
+    L.append(("head", " SLEEP  " + SLEEP_SOURCE_LABEL[r.meta.get("sleep_source", "heuristic")]))
     if not r.sleep:
-        need = "" if any(m.n for m in r.minutes) else " — no worn data in window"
-        L.append(("dim", f"  no sleep window detected yet (needs ≥{MIN_SLEEP_MIN} min still + calm HR){need}"))
+        L.append(("dim", "  " + no_sleep_msg(r)))
     for s in reversed(r.sleep[-3:]):
         hrs = s.hrs
         eff = 100 * s.asleep_min / max(1, s.span_min)
@@ -302,6 +410,14 @@ def text_lines(r: Report, width: int = 80) -> list[tuple[str, str]]:
                            f"asleep≈{dur(s.asleep_min)} ({eff:.0f}%)"))
         if hrs:
             L.append(("", f"    sleeping HR avg {st.mean(hrs):.0f}  low {min(hrs):.0f} bpm"))
+        if s.stages is not None:
+            sm = s.stage_minutes()
+            extra = (f"   resting {s.resting_hr}" if s.resting_hr else "") + \
+                    (f"   HRV {s.avg_hrv:.0f} ms" if s.avg_hrv else "")
+            L.append(("", "    " + "  ".join(f"{k} {dur(sm[k])}" for k in ("deep", "light", "rem", "wake")) + extra))
+            L.append(("sleep", "    " + stage_bar(s, w - 4)))
+            L.append(("dim", "    " + "  ".join(f"{STAGE_CHAR[k]} {k}" for k in STAGES)))
+            continue
         bins = bucket(s.minutes, s.start, s.end, w - 4)
         L.append(("sleep", "    " + "".join(
             " " if not b else "█" if sum(m.asleep for m in b) * 2 >= len(b) else "░" for b in bins)))
@@ -359,14 +475,43 @@ def render_html(r: Report, refresh: int | None = None) -> str:
                  + tile("Resting HR ≈", f"{stats['rest']:.0f}", " bpm", "5th pct of still minutes")
                  + tile("Range", f"{stats['min']:.0f}–{stats['max']:.0f}", " bpm", f"avg {stats['avg']:.0f}")
                  + tile("Worn", dur(stats["worn_min"]), "", f"last {(r.until - r.since) // 3600}h"))
-    sleep_rows = "".join(
-        f"<tr><td>{T(s.start, 'stamp')} → {T(s.end)}</td><td>{dur(s.span_min)}</td><td>{dur(s.asleep_min)}</td>"
-        f"<td>{(st.mean(s.hrs) if s.hrs else 0):.0f}</td><td>{(min(s.hrs) if s.hrs else 0):.0f}</td></tr>"
-        for s in reversed(r.sleep))
-    sleep_html = (f'<table><tr><th>Window <span class="tz">{e(local_tz)}</span></th><th>In bed</th><th>Asleep ≈</th><th>Avg HR</th><th>Low HR</th></tr>'
-                  f'{sleep_rows}</table>' if r.sleep else
-                  f'<p class="dim">No sleep window detected yet. It needs at least {MIN_SLEEP_MIN} minutes of the '
-                  f'strap being still with calm heart rate. Wear it overnight, then sync.</p>')
+    staged = r.meta.get("sleep_source") == "noop"
+    st_cols = "".join(f"<th>{k.capitalize()}</th>" for k in ("deep", "light", "rem", "wake")) if staged else ""
+
+    def row(s):
+        cells = (f"<td>{T(s.start, 'stamp')} → {T(s.end)}</td><td>{dur(s.span_min)}</td><td>{dur(s.asleep_min)}</td>"
+                 f"<td>{(st.mean(s.hrs) if s.hrs else 0):.0f}</td><td>{(min(s.hrs) if s.hrs else 0):.0f}</td>")
+        if staged:
+            sm = s.stage_minutes()
+            cells += "".join(f"<td>{dur(sm[k])}</td>" for k in ("deep", "light", "rem", "wake"))
+        return f"<tr>{cells}</tr>"
+
+    def hypnogram(s):
+        HW, LH, LP = 900, 26, 56                    # width, lane height, left pad for lane labels
+        x = lambda t: LP + (t - s.start) / max(1, s.end - s.start) * (HW - LP - 10)
+        lanes = "".join(f'<text class="ax" x="{LP - 8}" y="{i * LH + LH * .65:.1f}" text-anchor="end">{k.upper()}</text>'
+                        f'<line class="grid" x1="{LP}" x2="{HW - 10}" y1="{(i + 1) * LH}" y2="{(i + 1) * LH}"/>'
+                        for i, k in enumerate(STAGES))
+        rects = "".join(
+            f'<rect x="{x(g["start"]):.1f}" y="{STAGES.index(g["stage"]) * LH + 3}" '
+            f'width="{max(.8, x(g["end"]) - x(g["start"])):.1f}" height="{LH - 6}" rx="2" fill="{STAGE_COLOR[g["stage"]]}">'
+            f'<title data-range="{g["start"]},{g["end"]}" data-label="{g["stage"]}">{g["stage"]}</title></rect>'
+            for g in s.stages or () if g["stage"] in STAGES)
+        ticks = "".join(f'<text class="ax" x="{x(t):.1f}" y="{len(STAGES) * LH + 16}" text-anchor="middle" '
+                        f'data-t="{int(t)}" data-f="hm">{hhmm(int(t))}</text>'
+                        for t in (s.start + (s.end - s.start) * i / 4 for i in range(5)))
+        H2 = len(STAGES) * LH + 24
+        return (f'<div class="hyp"><div class="dim">{T(s.start, "stamp")} → {T(s.end)} · '
+                f'resting HR {s.resting_hr or "—"} · HRV {f"{s.avg_hrv:.0f} ms" if s.avg_hrv else "—"}</div>'
+                f'<svg viewBox="0 0 {HW} {H2}" role="img" aria-label="Sleep stages">{lanes}{rects}{ticks}</svg></div>')
+
+    legend = " ".join(f'<span class="key"><i style="background:{STAGE_COLOR[k]}"></i>{k}</span>' for k in STAGES)
+    hyps = (f'<div class="dim">Stages from NOOP SleepStager · time axis <span class="tz">{e(local_tz)}</span> · {legend}</div>'
+            + "".join(hypnogram(s) for s in reversed(r.sleep[-3:]))) if staged and r.sleep else ""
+    sleep_html = (f'{hyps}<table><tr><th>Window <span class="tz">{e(local_tz)}</span></th><th>In bed</th>'
+                  f'<th>Asleep ≈</th><th>Avg HR</th><th>Low HR</th>{st_cols}</tr>'
+                  + "".join(row(s) for s in reversed(r.sleep)) + '</table>' if r.sleep else
+                  f'<p class="dim">{e(no_sleep_msg(r))}</p>')
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{meta}<title>Whoop PoC</title>
@@ -386,14 +531,17 @@ svg{{width:100%;height:auto;display:block}}
 polyline.hr{{fill:none;stroke:var(--hr);stroke-width:2;stroke-linejoin:round}} circle.hr{{fill:var(--hr)}}
 .grid{{stroke:var(--line)}} .ax{{fill:var(--dim);font-size:11px}} .band{{fill:var(--sleep)}}
 table{{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}}
-th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}} th{{color:var(--dim);font-weight:500;font-size:13px}}
+th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}}
+.hyp{{margin:10px 0 18px}} .key{{margin-left:10px;white-space:nowrap}}
+.key i{{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}}
+.card{{overflow-x:auto}} th{{color:var(--dim);font-weight:500;font-size:13px}}
 </style></head><body><main>
 <h1>Whoop PoC · {e(r.meta.get('name') or r.meta['address'])}</h1>
 <div class="dim">Last {(r.until - r.since) // 3600}h · last sync {T(r.meta['last_sync'], 'stamp')} · generated {T(time.time(), 'stamp')} · times shown in <span class="tz">{e(local_tz)}</span></div>
 <div class="tiles">{tiles}</div>
 <h2>Heart rate (per-minute average)</h2><div class="card">{svg}
 <div class="dim">Time axis: <span class="tz">{e(local_tz)}</span>. Shaded areas are approximate sleep windows.</div></div>
-<h2>Sleep <span class="dim">(approximate: motion + HR heuristic, not WHOOP sleep staging)</span></h2>
+<h2>Sleep <span class="dim">{e(SLEEP_SOURCE_LABEL[r.meta.get("sleep_source", "heuristic")])}</span></h2>
 <div class="card">{sleep_html}</div>
 </main>
 <script>
@@ -404,7 +552,7 @@ th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}} th{
   document.querySelectorAll("[data-t]").forEach(el => el.textContent = f(+el.dataset.t, el.dataset.f));
   document.querySelectorAll("[data-range]").forEach(el => {{
     const [a, b] = el.dataset.range.split(",");
-    el.textContent = `approx. sleep ${{f(+a, "hm")}}–${{f(+b, "hm")}}`;
+    el.textContent = `${{el.dataset.label || "approx. sleep"}} ${{f(+a, "hm")}}–${{f(+b, "hm")}}`;
   }});
   // zone label: IANA name + abbreviation(s) for the times actually on the page (EST vs EDT across DST)
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -422,7 +570,7 @@ def run_html(args) -> None:
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
     while True:
-        r = build_report(args.db, args.hours, args.address, demo=args.demo)
+        r = build_report(args.db, args.hours, args.address, demo=args.demo, heuristic=args.heuristic)
         out.write_text(render_html(r, args.refresh if args.watch else None))
         print(f"wrote {out}  ({len(r.samples)} samples, {len(r.sleep)} sleep window(s))", flush=True)
         if not args.watch:
@@ -456,6 +604,7 @@ def main(argv=None) -> None:
     p.add_argument("--refresh", type=int, default=30, help="TUI reload / html --watch interval, seconds")
     p.add_argument("--out", default="out/whoop.html", help="html output path (default out/whoop.html)")
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
+    p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")
     a = p.parse_args(argv)
     a.db = a.db.expanduser()
@@ -468,7 +617,7 @@ def main(argv=None) -> None:
         run_tui(a)
     elif a.cmd == "summary":
         width = shutil.get_terminal_size((88, 24)).columns
-        for _, line in text_lines(build_report(a.db, a.hours, a.address, demo=a.demo), width):
+        for _, line in text_lines(build_report(a.db, a.hours, a.address, demo=a.demo, heuristic=a.heuristic), width):
             print(line)
     else:
         run_html(a)

@@ -63,9 +63,39 @@ class Sleep(unittest.TestCase):
         self.assertIn("NOT your night", r.meta["name"])
 
     def test_renderers(self):
-        r = w.build_report(None, 24, None, now=self.END, demo=True)
+        r = w.build_report(None, 24, None, now=self.END, demo=True, heuristic=True)
         self.assertIn("asleep", "\n".join(t for _, t in w.text_lines(r, 100)))
         self.assertIn('<rect class="band"', w.render_html(r))
+
+
+class Stages(unittest.TestCase):
+    END = 1793880000
+
+    def fake_window(self):
+        st = [{"start": 0, "end": 1800, "stage": "light"}, {"start": 1800, "end": 3000, "stage": "deep"},
+              {"start": 3000, "end": 3600, "stage": "rem"}, {"start": 3600, "end": 3900, "stage": "wake"}]
+        return w.SleepWindow(0, 3900, [], stages=st, resting_hr=50, avg_hrv=60.0)
+
+    def test_stage_accounting(self):
+        s = self.fake_window()
+        self.assertEqual(s.stage_minutes(), {"wake": 5, "rem": 10, "light": 30, "deep": 20})
+        self.assertEqual(s.asleep_min, 60)
+        self.assertEqual(w.stage_bar(s, 13), "▅▅▅▅▅▅████▃▃·")
+
+    def test_html_hypnogram(self):
+        r = w.build_report(None, 24, None, now=self.END, demo=True, heuristic=True)
+        r.meta["sleep_source"], r.sleep = "noop", [self.fake_window()]
+        html = w.render_html(r)
+        self.assertIn('aria-label="Sleep stages"', html)
+        self.assertIn("<th>Deep</th>", html)
+
+    @unittest.skipUnless(w.STAGER_BIN.exists(), "stager not built (cd stager && ./build.sh)")
+    def test_noop_stager_runs_on_demo_night(self):
+        r = w.build_report(None, 24, None, now=self.END, demo=True)
+        self.assertEqual(r.meta["sleep_source"], "noop")
+        self.assertTrue(r.sleep)
+        self.assertGreater(sum(s.asleep_min for s in r.sleep), 6 * 60)
+        self.assertTrue(all(g["stage"] in w.STAGES for s in r.sleep for g in s.stages))
 
 
 if __name__ == "__main__":

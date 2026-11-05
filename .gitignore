@@ -11,3 +11,9 @@ capture*.json
 .venv/
 __pycache__/
 *.pyc
+# stager: NOOP sources are symlinked in by stager/link-noop.sh, never committed
+stager/.build/
+stager/Sources/StrandAnalytics/
+stager/Tests/
+stager/WhoopProtocol
+stager/Package.resolved
