@@ -123,3 +123,9 @@ filtering raw accel to gravity and resampling HR to 1 Hz gets reasonably close.
   specificity 0.22, 4-class κ 0.09. V2 4-class κ 0.30. Sleep onset is called early on every night (median −9 min,
   −19.5 min when sleep latency ≥ 15 min), and lying awake after the final wake is scored as sleep (median +17 min,
   n=5). This confirms we need an in-bed layer separate from sleep (experiments 2 and 4).
+- **2026-11-05, Experiment 2 done:** [hdcza-tib.md](hdcza-tib.md). HDCZA (`hdcza.py`) marks getting into bed:
+  +2.2 min from lights-off on Walch (MAE 5.3), about 0 median from PSG start on Newcastle, and 7–25 min
+  before PSG sleep onset. It does **not** recover sleep-onset latency on its own, because NOOP calls sleep from the first
+  still epoch. On Will's 2026-11-04 night HDCZA says 00:06 (NOOP 00:07): the wrist was actively moving
+  from 23:48 to 00:04, so wrist motion alone can't place bedtime. The next lever is a bed marker or HR cue
+  (experiments 3 and 4).
