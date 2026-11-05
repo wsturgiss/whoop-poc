@@ -1,0 +1,13 @@
+# Never commit biometrics: NOOP stores, exports, generated pages
+*.db
+*.db-*
+*.sqlite*
+captures/
+out/
+*.html
+*.jsonl
+capture*.json
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
