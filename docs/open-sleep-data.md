@@ -46,6 +46,8 @@ useful if we train an HR-only model, which is how SleepECG and SleepPPG-Net pret
 | [bzhai/multimodal_sleep_stage_benchmark](https://github.com/bzhai/multimodal_sleep_stage_benchmark) — Zhai et al. 2020, IMWUT 4(2):67 "Making Sense of Sleep" | MESA benchmark: actigraphy + HR features, ML/DL, 2–5 stages | **MIT** | Good recipe and feature list for training on MESA. Finding: movement beats cardiac-only for sleep/wake, while cardiac helps the stage classes. |
 | SleepPPG-Net — [Kotzen et al., arXiv 2202.05735](https://arxiv.org/abs/2202.05735) (IEEE JBHI 2023) | Raw-PPG 4-class staging. Trained on MESA, pretrained on SHHS ECG. Median κ 0.75 on held-out MESA | Paper only; no official weights found | Shows the ceiling with **raw PPG**. We only get HR/RR from the strap, so this is a reference point and not something we can deploy. |
 
+Wear side: the strap is on the right wrist since 2026-11-05 (left before). See [hdcza-tib.md](hdcza-tib.md#wear-side).
+
 ## Papers worth reading (sleep onset, wake, efficiency)
 
 - **Walch et al. 2019, *Sleep*** (dataset above). This is the source of NOOP's quoted EEG-free ~65–73 % 4-class

@@ -23,6 +23,12 @@ from wrist z-angle so "awake in bed" = TIB minus NOOP sleep, before onset and af
 Reproduce: `python3 -I bench/tib_harness.py walch [--v2]`, `python3 -I bench/tib_harness.py newcastle --wrist left|right`,
 `python3 -I bench/tib_night.py --since "YYYY-MM-DD 12:00" --until "YYYY-MM-DD 12:00" --bed HH:MM --up HH:MM`.
 
+## Wear side
+
+Since 2026-11-05 the Whoop Strap 4 is worn on the **right** wrist (previously left). whoop.db nights
+before that date are left-wrist. HDCZA z-angle thresholds and TIB edges may shift after the side change
+until re-checked on right-wrist nights. HR-based NOOP staging should be unaffected.
+
 ## Results
 
 Values are median (mean absolute error) in minutes; negative = earlier than the reference.
