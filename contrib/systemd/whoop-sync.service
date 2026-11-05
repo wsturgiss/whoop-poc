@@ -1,0 +1,15 @@
+[Unit]
+Description=Drain WHOOP 4.0 history into the NOOP store (whoop.db)
+After=bluetooth.target
+
+[Service]
+Type=oneshot
+# whoop-sync stops itself after WHOOP_SYNC_MAX (default 20 min) of draining. Clock check, strap
+# acquire and the decode step add a few minutes on top. A partial drain is fine: chunks are
+# committed before they are acked, so the next timer run resumes from the strap's cursor.
+ExecStart=%h/.local/bin/whoop-sync sync
+# Refresh the Coach-readable snapshot after every attempt, even when the drain failed (- = ignore errors).
+ExecStopPost=-%h/.local/bin/whoop-poc json --out %S/whoop-poc/coach.json
+TimeoutStartSec=30min
+TimeoutStopSec=3min
+Nice=10

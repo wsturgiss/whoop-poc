@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic WHOOP 4.0 history drain
+
+[Timer]
+OnBootSec=5min
+# 15 min after the last run finished, whether it drained, stopped early or missed the strap.
+OnUnitInactiveSec=15min
+RandomizedDelaySec=1min
+
+[Install]
+WantedBy=timers.target

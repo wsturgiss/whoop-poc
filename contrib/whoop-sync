@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# whoop-sync: wrapper around NOOP's linux-capture whoop_sync.py for one paired WHOOP 4.0 strap.
+#
+#   whoop-sync [sync|realtime|status|decode|export|label|devices] [extra whoop_sync.py args...]
+#
+# Config (not in git): ~/.config/whoop-poc/env, sourced if present. Keys:
+#   WHOOP_ADDRESS       strap BLE MAC (required for sync/realtime/status)
+#   WHOOP_CAPTURE_DIR   NOOP linux-capture dir   (default ~/src/noop/tools/linux-capture)
+#   WHOOP_DB            store, relative to WHOOP_CAPTURE_DIR or absolute (default captures/whoop.db)
+#   WHOOP_SYNC_MAX      seconds one `sync` may drain before stopping cleanly (default 1200).
+#                       Must stay below the unit's TimeoutStartSec, or systemd kills it mid-drain.
+#   WHOOP_DECODE        NOOP whoop-decode binary (feat_* tables are decoded after each drain)
+#
+# Resume: NOOP commits every chunk (fsync) before acking it to the strap, and the strap only trims
+# acked chunks. A drain that stops early (--max, SIGTERM, BLE drop, strap gone) loses nothing.
+# The next run picks up from the strap's cursor. Each `sync` attempt is recorded in
+# $XDG_STATE_HOME/whoop-poc/sync.json (outcome + time) so readers can tell "no new data" from "sync failing".
+set -euo pipefail
+umask 077   # state files (sync log, sync.json) are owner-only
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/whoop-poc/env
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+DIR=${WHOOP_CAPTURE_DIR:-$HOME/src/noop/tools/linux-capture}
+DB=${WHOOP_DB:-captures/whoop.db}
+MAX=${WHOOP_SYNC_MAX:-1200}
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/whoop-poc
+LOCK=${XDG_RUNTIME_DIR:-/tmp}/whoop-sync.lock
+export WHOOP_DECODE=${WHOOP_DECODE:-$HOME/src/noop/Packages/WhoopProtocol/.build/release/whoop-decode}
+
+need_addr() { [ -n "${WHOOP_ADDRESS:-}" ] || { echo "whoop-sync: set WHOOP_ADDRESS in $CONF" >&2; exit 2; }; }
+
+cmd=${1:-sync}; shift || true
+cd "$DIR"
+py=(.venv/bin/python whoop_sync.py)
+
+# Write sync.json atomically: {"attempt_unix", "finished_unix", "outcome", "exit", "frames_stored"}
+record() {  # record <outcome> <exit> <frames> <started>
+  mkdir -p "$STATE"
+  printf '{"schema":1,"attempt_unix":%s,"finished_unix":%s,"outcome":"%s","exit":%s,"frames_stored":%s}\n' \
+    "$4" "$(date +%s)" "$1" "$2" "$3" > "$STATE/sync.json.tmp"
+  mv -f "$STATE/sync.json.tmp" "$STATE/sync.json"
+}
+
+exec 9>"$LOCK"   # only one BLE session with the strap at a time
+case "$cmd" in
+  status) need_addr; exec "${py[@]}" status --db "$DB" --address "$WHOOP_ADDRESS" "$@" ;;
+  realtime)
+    need_addr
+    flock -n 9 || { echo "whoop-sync: another session holds the strap; skipping"; exit 0; }
+    exec "${py[@]}" realtime --model whoop4 --address "$WHOOP_ADDRESS" --subject me --db "$DB" "$@" ;;
+  sync)
+    need_addr
+    flock -n 9 || { echo "whoop-sync: another session holds the strap; skipping"; exit 0; }
+    started=$(date +%s)
+    mkdir -p "$STATE"
+    log="$STATE/last-sync.log"
+    # SIGTERM (systemd stop/timeout) reaches python directly via the cgroup; it stops, commits and decodes.
+    set +e
+    "${py[@]}" sync --model whoop4 --address "$WHOOP_ADDRESS" --subject me --db "$DB" --max "$MAX" "$@" 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    frames=$(sed -n 's/^stored this run: \([0-9]*\) frames.*/\1/p' "$log" | tail -1)
+    if grep -q 'could not find the strap advertising' "$log"; then outcome=not_advertising
+    elif grep -q 'drained to completion: yes' "$log"; then outcome=complete
+    elif grep -q 'drained to completion: no' "$log"; then outcome=partial
+    elif [ "$rc" -ne 0 ]; then outcome=error
+    else outcome=unknown; fi
+    record "$outcome" "$rc" "${frames:-0}" "$started"
+    exit "$rc" ;;
+  *) exec "${py[@]}" "$cmd" "$@" ;;
+esac
