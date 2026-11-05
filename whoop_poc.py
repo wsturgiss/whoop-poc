@@ -7,7 +7,7 @@ decodes WHOOP 4.0 type-47 HISTORICAL_DATA records (v12/v24 layout), and shows:
   * heart rate: latest, per-minute trend, min/avg/max, approximate resting HR
   * sleep: windows detected by a simple motion + HR heuristic (NOT WHOOP's sleep staging)
 
-Subcommands:  tui (default) | summary | html
+Subcommands:  tui (default) | summary | html | json (Coach snapshot) | serve (localhost JSON)
 Core + HTML are stdlib only; the TUI (tui.py) uses Textual. Does no BLE itself; `--sync` shells out to `whoop-sync` / linux-capture's whoop_sync.py.
 """
 from __future__ import annotations
@@ -578,6 +578,112 @@ def run_html(args) -> None:
         time.sleep(args.refresh)
 
 
+# ------------------------------------------------------------------------- Coach-readable snapshot
+SNAPSHOT_SCHEMA = "whoop-poc/snapshot@1"     # bump on any breaking change; see COACH.md
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "whoop-poc"
+
+
+def _iso(t: int | None) -> str | None:
+    return None if t is None else datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+
+
+def last_sync_attempt() -> dict | None:
+    """What the whoop-sync wrapper recorded for its latest `sync` attempt (None if never)."""
+    import json
+    try:
+        return json.loads((STATE_DIR / "sync.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def snapshot(r: Report, now: int | None = None) -> dict:
+    """Stable JSON document for other programs (e.g. Coach). Schema documented in COACH.md."""
+    now = now or int(time.time())
+    hr_now, stats = r.hr_now, r.hr_stats()
+    newest = r.samples[-1].unix if r.samples else None
+    sessions = []
+    for s in r.sleep:
+        hrs = s.hrs
+        sessions.append({
+            "start_unix": s.start, "end_unix": s.end, "start_iso": _iso(s.start), "end_iso": _iso(s.end),
+            "in_bed_min": s.span_min, "asleep_min": s.asleep_min,
+            "stage_min": s.stage_minutes() if s.stages is not None else None,
+            "avg_hr": round(st.mean(hrs), 1) if hrs else None,
+            "resting_hr": s.resting_hr, "avg_hrv_ms": round(s.avg_hrv, 1) if s.avg_hrv else None,
+            "stages": [{"start_unix": g["start"], "end_unix": g["end"], "stage": g["stage"]}
+                       for g in s.stages] if s.stages is not None else None,
+        })
+    return {
+        "schema": SNAPSHOT_SCHEMA,
+        "demo": r.meta.get("address") == "-",
+        "generated_unix": now, "generated_iso": _iso(now),
+        "window": {"since_unix": r.since, "until_unix": r.until, "hours": round((r.until - r.since) / 3600, 2)},
+        "device": {"address": r.meta.get("address"), "name": r.meta.get("name")},
+        "freshness": {
+            "newest_sample_unix": newest, "newest_sample_iso": _iso(newest),
+            "data_age_min": None if newest is None else round((now - newest) / 60, 1),
+            "last_received_unix": r.meta.get("last_sync") or None,
+            "last_sync_attempt": last_sync_attempt(),
+        },
+        "hr": {
+            "latest": None if hr_now is None else {"unix": hr_now.unix, "iso": _iso(hr_now.unix), "bpm": hr_now.hr},
+            "stats": None if stats is None else {
+                "min": round(stats["min"]), "avg": round(stats["avg"], 1), "max": round(stats["max"]),
+                "resting_est": round(stats["rest"]), "worn_min": stats["worn_min"]},
+            "per_minute": [[m.t, round(m.hr, 1)] for m in r.hr_minutes],
+        },
+        "sleep": {"source": r.meta.get("sleep_source"), "sessions": sessions},
+        "labels": [{"start_unix": a, "end_unix": b, "activity": act} for a, b, act in r.meta.get("labels", [])],
+    }
+
+
+def write_json(path: Path, doc: dict) -> None:
+    """Atomic, owner-only write (biometric data)."""
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def run_serve(args) -> None:
+    """Tiny localhost-only JSON endpoint: GET /v1/snapshot[?hours=N], GET /healthz."""
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            if u.path == "/healthz":
+                code, doc = 200, {"ok": True}
+            elif u.path == "/v1/snapshot":
+                try:
+                    hours = float(parse_qs(u.query).get("hours", [args.hours])[0])
+                    doc = snapshot(build_report(args.db, hours, args.address, demo=args.demo, heuristic=args.heuristic))
+                    code = 200
+                except (ValueError, SystemExit) as e:
+                    code, doc = 400, {"error": str(e)}
+            else:
+                code, doc = 404, {"error": "try /v1/snapshot"}
+            body = json.dumps(doc).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), H)
+    print(f"serving http://127.0.0.1:{args.port}/v1/snapshot", flush=True)
+    srv.serve_forever()
+
+
 # ------------------------------------------------------------------------------------------ sync
 def run_sync(quiet: bool = False) -> bool:
     """Reuse linux-capture: prefer the `whoop-sync` wrapper, else call whoop_sync.py directly."""
@@ -596,13 +702,15 @@ def run_sync(quiet: bool = False) -> bool:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="whoop-poc", description=__doc__.splitlines()[0])
-    p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html"])
+    p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "json", "serve"])
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"NOOP whoop.db (default {DEFAULT_DB}; env WHOOP_DB)")
     p.add_argument("--address", help="strap MAC if the DB holds several devices")
     p.add_argument("--hours", type=float, default=24, help="look-back window (default 24)")
     p.add_argument("--sync", action="store_true", help="drain new history from the strap first")
     p.add_argument("--refresh", type=int, default=30, help="TUI reload / html --watch interval, seconds")
-    p.add_argument("--out", default="out/whoop.html", help="html output path (default out/whoop.html)")
+    p.add_argument("--out", default=None, help="html: output path (default out/whoop.html); json: write here "
+                   "atomically instead of stdout")
+    p.add_argument("--port", type=int, default=8787, help="serve: localhost port (default 8787)")
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
     p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")
@@ -619,7 +727,17 @@ def main(argv=None) -> None:
         width = shutil.get_terminal_size((88, 24)).columns
         for _, line in text_lines(build_report(a.db, a.hours, a.address, demo=a.demo, heuristic=a.heuristic), width):
             print(line)
+    elif a.cmd == "json":
+        import json
+        doc = snapshot(build_report(a.db, a.hours, a.address, demo=a.demo, heuristic=a.heuristic))
+        if a.out:
+            write_json(Path(a.out).expanduser(), doc)
+        else:
+            print(json.dumps(doc, indent=1))
+    elif a.cmd == "serve":
+        run_serve(a)
     else:
+        a.out = a.out or "out/whoop.html"
         run_html(a)
 
 

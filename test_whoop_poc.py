@@ -100,3 +100,29 @@ class Stages(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Snapshot(unittest.TestCase):
+    """The Coach contract (COACH.md): keys and types must stay stable within a schema version."""
+
+    def test_heuristic_demo_snapshot_shape(self):
+        import json, os, tempfile
+        from pathlib import Path
+        r = w.build_report(Path("/nonexistent"), 24, None, demo=True, heuristic=True)
+        doc = json.loads(json.dumps(w.snapshot(r, now=w.DEMO_END)))
+        self.assertEqual(doc["schema"], "whoop-poc/snapshot@1")
+        self.assertTrue(doc["demo"])
+        self.assertEqual(set(doc), {"schema", "demo", "generated_unix", "generated_iso", "window", "device",
+                                    "freshness", "hr", "sleep", "labels"})
+        self.assertEqual(doc["hr"]["latest"]["unix"], doc["freshness"]["newest_sample_unix"])
+        self.assertEqual(doc["sleep"]["source"], "heuristic")
+        s = doc["sleep"]["sessions"][0]
+        self.assertIsNone(s["stages"])
+        self.assertGreater(s["asleep_min"], 6 * 60)
+        t, bpm = doc["hr"]["per_minute"][0]
+        self.assertIsInstance(t, int)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "sub" / "coach.json"
+            w.write_json(p, doc)
+            self.assertEqual(json.loads(p.read_text())["schema"], w.SNAPSHOT_SCHEMA)
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
