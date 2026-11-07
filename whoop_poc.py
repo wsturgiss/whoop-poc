@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import html
 import os
+import re
 import shutil
 import sqlite3
 import statistics as st
@@ -635,6 +636,48 @@ def snapshot(r: Report, now: int | None = None) -> dict:
         "sleep": {"source": r.meta.get("sleep_source"), "sessions": sessions},
         "labels": [{"start_unix": a, "end_unix": b, "activity": act} for a, b, act in r.meta.get("labels", [])],
     }
+
+
+_PROGRESS = re.compile(r"sync \S+\s+(\d+)%.*?@(\d\d-\d\d \d\d:\d\d:\d\d)\s+([\d.]+) rec/s\s+ETA (\S+)\s+stored ([\d,]+)")
+
+
+def drain_running() -> bool:
+    """True while any `whoop_sync.py sync` process is alive (TUI `s`, timer, or manual)."""
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            argv = (p / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if any(a.endswith(b"whoop_sync.py") for a in argv) and b"sync" in argv:
+            return True
+    return False
+
+
+def drain_status() -> dict | None:
+    """None when no drain is running, else {phase, pct, at, rate, eta, stored} parsed from the
+    tail of the wrapper's last-sync.log (fields are None until the first progress line)."""
+    if not drain_running():
+        return None
+    out = {"phase": "connecting", "pct": None, "at": None, "rate": None, "eta": None, "stored": None}
+    try:
+        with open(STATE_DIR / "last-sync.log", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            lines = f.read().decode(errors="replace").replace("\r", "\n").splitlines()
+    except OSError:
+        return out
+    for ln in lines:
+        if m := _PROGRESS.search(ln):
+            pct, at, rate, eta, stored = m.groups()
+            out.update(phase="draining", pct=int(pct), at=at, rate=float(rate), eta=eta,
+                       stored=int(stored.replace(",", "")))
+        elif "session ended" in ln or "acquire:" in ln:
+            out["phase"] = "reconnecting" if out["pct"] is not None else "connecting"
+        elif "stored this run" in ln or "decoded features" in ln:
+            out["phase"] = "finishing"
+    return out
 
 
 def write_json(path: Path, doc: dict) -> None:

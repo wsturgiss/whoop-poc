@@ -126,3 +126,26 @@ class Snapshot(unittest.TestCase):
             w.write_json(p, doc)
             self.assertEqual(json.loads(p.read_text())["schema"], w.SNAPSHOT_SCHEMA)
             self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+
+class Drain(unittest.TestCase):
+    def test_bar_moves_and_fills(self):
+        from tui import drain_bar
+        a, b = drain_bar(50, 0, 20), drain_bar(50, 3, 20)
+        self.assertEqual(len(a), 22)
+        self.assertTrue(a.startswith("▕" + "█" * 10))
+        self.assertNotEqual(a, b)                      # the pulse moves between frames
+        self.assertEqual(drain_bar(100, 5, 20), "▕" + "█" * 20 + "▏")
+
+    def test_parses_progress_log(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "last-sync.log").write_text(
+                "connected: True\n  sync 4C   63% ▕██████░░░░▏ @11-05 00:09:33  11.1 rec/s  ETA 1m45s  stored 2,254\n")
+            with mock.patch.object(w, "STATE_DIR", Path(d)), mock.patch.object(w, "drain_running", return_value=True):
+                s = w.drain_status()
+            self.assertEqual((s["phase"], s["pct"], s["at"], s["stored"]), ("draining", 63, "11-05 00:09:33", 2254))
+            with mock.patch.object(w, "drain_running", return_value=False):
+                self.assertIsNone(w.drain_status())

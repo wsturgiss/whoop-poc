@@ -18,11 +18,30 @@ class Tile(Static):
         self.update(f"[dim]{label}[/]\n[b]{value}[/]\n[dim]{note}[/]")
 
 
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def drain_bar(pct: int | None, frame: int, width: int = 28) -> str:
+    """Filled portion = progress; a bright pulse sweeps through the rest so the bar visibly moves
+    even when pct (the strap's own counter) advances slowly. pct None = indeterminate."""
+    filled = 0 if pct is None else max(0, min(width, round(width * pct / 100)))
+    rest = width - filled
+    cells = ["█"] * filled + ["·"] * rest
+    if rest:
+        head = filled + frame % (rest + 4) - 2          # sweeps left→right, briefly off both ends
+        for off, ch in ((0, "▓"), (-1, "▒"), (-2, "░"), (1, "▒")):
+            i = head + off
+            if filled <= i < width:
+                cells[i] = ch
+    return "▕" + "".join(cells) + "▏"
+
+
 class WhoopApp(App):
     TITLE = "Whoop PoC"
     CSS = """
     Screen { padding: 0 1; }
     #meta { color: $text-muted; height: auto; margin-bottom: 1; }
+    #drain { height: auto; color: $accent; border: round $accent; padding: 0 1; display: none; }
     .h { text-style: bold; color: $warning; margin-top: 1; height: auto; }
     #tiles { height: 5; }
     Tile { border: round $panel-lighten-2; width: 1fr; height: 5; padding: 0 1; }
@@ -39,11 +58,15 @@ class WhoopApp(App):
     def __init__(self, args) -> None:
         super().__init__()
         self.args = args
+        self._frame = 0
+        self._drain: dict | None = None
+        self._was_draining = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with VerticalScroll():
             yield Static(id="meta")
+            yield Static(id="drain")
             yield Static("HEART RATE", classes="h")
             with Horizontal(id="tiles"):
                 for i in ("now", "rest", "range", "worn"):
@@ -61,6 +84,42 @@ class WhoopApp(App):
     def on_mount(self) -> None:
         self.action_reload()
         self.set_interval(self.args.refresh, self.action_reload)
+        self.poll_drain()
+        self.set_interval(1.0, self.poll_drain)
+        self.set_interval(0.1, self.animate_drain)
+
+    def poll_drain(self) -> None:
+        self._drain = None if self.args.demo else core.drain_status()
+        if self._drain:
+            self._was_draining = True
+            if self._frame % 100 < 10:          # ~every 10 s while draining: show data as it lands
+                self.action_reload()
+        elif self._was_draining:
+            self._was_draining = False
+            self.query_one("#drain", Static).display = False
+            self.action_reload()
+            self.notify("Drain finished — data reloaded")
+
+    def animate_drain(self) -> None:
+        d, w = self._drain, self.query_one("#drain", Static)
+        if not d:
+            return
+        self._frame += 1
+        spin = SPINNER[self._frame % len(SPINNER)]
+        label = {"draining": "DRAINING STRAP", "connecting": "CONNECTING TO STRAP",
+                 "reconnecting": "RECONNECTING (BLE dropped, resuming)", "finishing": "SAVING + DECODING"}[d["phase"]]
+        bits = []
+        if d["at"]:
+            bits.append(f"synced through [b]{d['at'][:-3]}[/]")
+        if d["rate"] is not None:
+            bits.append(f"{d['rate']:.0f} rec/s")
+        if d["eta"] and d["eta"] != "—":
+            bits.append(f"ETA {d['eta']}")
+        if d["stored"] is not None:
+            bits.append(f"{d['stored']:,} stored")
+        pct = f" {d['pct']:>3}%" if d["pct"] is not None else ""
+        w.update(f"[b]{spin} {label}[/]  {drain_bar(d['pct'], self._frame)}{pct}\n[dim]{' · '.join(bits)}[/]")
+        w.display = True
 
     def action_reload(self) -> None:
         r = core.build_report(self.args.db, self.args.hours, self.args.address, demo=self.args.demo)
