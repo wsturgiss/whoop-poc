@@ -746,19 +746,43 @@ def run_serve(args) -> None:
 
 
 # ------------------------------------------------------------------------------------------ sync
-def run_sync(quiet: bool = False) -> bool:
+def sync_cmd() -> list[str] | None:
     """Reuse linux-capture: prefer the `whoop-sync` wrapper, else call whoop_sync.py directly."""
-    cmd = ["whoop-sync", "sync"] if shutil.which("whoop-sync") else None
+    if shutil.which("whoop-sync"):
+        return ["whoop-sync", "sync"]
+    lc = Path(os.environ.get("WHOOP_CAPTURE_DIR", "~/src/noop/tools/linux-capture")).expanduser()
+    addr = os.environ.get("WHOOP_ADDRESS")
+    if not addr:
+        return None
+    return [str(lc / ".venv/bin/python"), str(lc / "whoop_sync.py"), "sync", "--model", "whoop4",
+            "--address", addr, "--subject", "me", "--db", str(DEFAULT_DB), "--max", "1200"]
+
+
+def run_sync(quiet: bool = False) -> bool:
+    """Blocking drain (used by --sync before showing anything)."""
+    cmd = sync_cmd()
     if not cmd:
-        lc = Path(os.environ.get("WHOOP_CAPTURE_DIR", "~/src/noop/tools/linux-capture")).expanduser()
-        addr = os.environ.get("WHOOP_ADDRESS")
-        if not addr:
-            print("set WHOOP_ADDRESS (strap MAC) or install the whoop-sync wrapper", file=sys.stderr)
-            return False
-        cmd = [str(lc / ".venv/bin/python"), str(lc / "whoop_sync.py"), "sync", "--model", "whoop4",
-               "--address", addr, "--subject", "me", "--db", str(DEFAULT_DB), "--max", "1800"]
+        print("set WHOOP_ADDRESS (strap MAC) or install the whoop-sync wrapper", file=sys.stderr)
+        return False
     out = subprocess.DEVNULL if quiet else None
     return subprocess.run(cmd, stdout=out, stderr=out).returncode == 0
+
+
+def start_sync_background() -> tuple[bool, str]:
+    """Start a drain the caller does NOT own, so a UI can quit while it runs (drains are resume-safe).
+    Prefers the systemd unit (also refreshes coach.json); falls back to a detached process."""
+    if drain_running():
+        return True, "A drain is already running"
+    r = subprocess.run(["systemctl", "--user", "start", "--no-block", "whoop-sync.service"],
+                       capture_output=True)
+    if r.returncode == 0:
+        return True, "Sync started (whoop-sync.service)"
+    cmd = sync_cmd()
+    if not cmd:
+        return False, "Set WHOOP_ADDRESS or run contrib/install.sh"
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return True, "Sync started in the background"
 
 
 def main(argv=None) -> None:

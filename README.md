@@ -5,7 +5,7 @@ A thin proof of concept that shows **heart rate** and **sleep** from a WHOOP 4.0
 It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav/noop)'s
 `tools/linux-capture/whoop_sync.py`. It doesn't do any Bluetooth itself: syncing is delegated to that tool.
 
-- **TUI** ([Textual](https://textual.textualize.io/)) shows latest, resting, range and worn-time HR, a per-minute HR sparkline, a sleep table with stage totals and a colored stage bar. It reloads automatically, and `s` syncs the strap.
+- **TUI** ([Textual](https://textual.textualize.io/)) shows latest, resting, range and worn-time HR, a per-minute HR sparkline, a sleep table with stage totals and a colored stage bar. It reloads automatically. `s` starts a background sync (the systemd unit if installed), and an animated banner shows its progress; `q` quits right away, even mid-drain, because drains resume safely.
 - **HTML** is a single static page with an HR chart, shaded sleep windows, a stage hypnogram per session and a sleep table, with light and dark themes.
 - **summary** is a plain-text printout.
 - **json** / **serve** emit a versioned JSON snapshot (latest HR, per-minute HR, sleep sessions + stages,

@@ -5,7 +5,6 @@ import statistics as st
 import time
 from datetime import datetime
 
-from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Sparkline, Static
@@ -127,13 +126,12 @@ class WhoopApp(App):
         r = core.build_report(self.args.db, self.args.hours, self.args.address, demo=self.args.demo)
         self.render_report(r)
 
-    @work(thread=True, exclusive=True)
     def action_sync(self) -> None:
-        self.call_from_thread(self.notify, "Syncing… (strap must be near the laptop)")
-        ok = core.run_sync(quiet=True)
-        self.call_from_thread(self.notify, "Sync done" if ok else "Sync failed — try `whoop-sync sync`",
-                              severity="information" if ok else "error")
-        self.call_from_thread(self.action_reload)
+        # Never own the drain: it can run 20 min, and q must quit immediately. The banner tracks it.
+        ok, msg = core.start_sync_background()
+        self.notify(msg + (" (strap must be near the laptop)" if ok else ""),
+                    severity="information" if ok else "error")
+        self.poll_drain()
 
     def action_window(self) -> None:
         steps = (24, 72, 168)
