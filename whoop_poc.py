@@ -680,7 +680,8 @@ def drain_pid() -> int | None:
 
 
 # ------------------------------------------------------------------------------------- live HR
-LIVE_MINUTES = 10      # live HR holds a BLE link open (strap battery), so it always auto-stops
+LIVE_MINUTES = int(os.environ.get("WHOOP_LIVE_MINUTES", 30))   # live HR holds a BLE link open (strap
+#                                                                  battery), so it always auto-stops
 
 
 def _alive(pid) -> bool:
@@ -713,6 +714,16 @@ def start_live(minutes: float = LIVE_MINUTES) -> str:
     subprocess.Popen(["whoop-sync", "live", "--minutes", str(minutes)], stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return msg
+
+
+def extend_live() -> bool:
+    """+10 min on a running live session (whoop_live.py handles SIGUSR1; capped at 3 h total)."""
+    import signal
+    d = live_status()
+    if not d:
+        return False
+    os.kill(int(d["pid"]), signal.SIGUSR1)
+    return True
 
 
 def stop_live() -> bool:

@@ -85,7 +85,7 @@ case "$cmd" in
     record "$outcome" "$rc" "${frames:-0}" "$started"
     exit "$rc" ;;
   live)
-    # Live HR for a limited time (default 10 min; costs strap battery). Waits briefly for the lock so a
+    # Live HR for a limited time (default 30 min, SIGUSR1 adds 10; costs strap battery). Waits briefly for the lock so a
     # drain that was just asked to stop can save + decode first. Holds the lock while live: timer syncs skip.
     need_addr
     flock -w 45 9 || { echo "whoop-sync: strap busy (a sync is running); try again shortly"; exit 1; }

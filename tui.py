@@ -54,6 +54,7 @@ class WhoopApp(App):
     """
     BINDINGS = [("q", "quit", "Quit"), ("r", "reload", "Reload"), ("s", "sync", "Sync strap now"),
                 ("w", "window", "Window 24h/3d/7d"), ("l", "live", "Live HR on/off"),
+                ("plus", "extend_live", "+10 min live"),
                 ("d", "toggle_dark", "Dark/light")]
 
     def __init__(self, args) -> None:
@@ -65,6 +66,7 @@ class WhoopApp(App):
         self._live: dict | None = None
         self._live_pending = 0.0        # until when a just-requested live session counts as starting
         self._live_ours = False         # this TUI started it → stop it on quit (strap battery)
+        self._live_stopping = None      # pid we asked to stop (it takes a few s to switch the stream off)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -108,6 +110,7 @@ class WhoopApp(App):
 
     def action_live(self) -> None:
         if self._live or time.time() < self._live_pending:
+            self._live_stopping = (self._live or {}).get("pid")
             core.stop_live()
             self._live_pending, self._live_ours = 0.0, False
             self.notify("Live HR off")
@@ -115,6 +118,12 @@ class WhoopApp(App):
             self.notify(core.start_live() + f" (auto-off after {core.LIVE_MINUTES} min)")
             self._live_pending, self._live_ours = time.time() + 60, True
         self.render_live()
+
+    def action_extend_live(self) -> None:
+        if core.extend_live():
+            self.notify("Live HR: +10 min")
+        else:
+            self.notify("Live HR isn't on (press l)", severity="warning")
 
     async def action_quit(self) -> None:
         if self._live_ours:                  # don't leave the strap streaming after we're gone
@@ -131,8 +140,11 @@ class WhoopApp(App):
         if not d:
             w.update("[b red]♥ LIVE HR[/]  [dim]starting… (waiting for the strap; a running sync saves first)[/]")
             return
+        if d.get("pid") == self._live_stopping:
+            w.update("[red]♡[/] [b]LIVE HR[/]  [dim]stopping (switching the stream off)…[/]")
+            return
         left = max(0, d["until_unix"] - int(time.time()))
-        tail = f"[dim]auto-off in {left // 60}:{left % 60:02d} · press l to stop[/]"
+        tail = f"[dim]auto-off in {left // 60}:{left % 60:02d} · + adds 10 min · l stops[/]"
         if d["state"] == "live" and d.get("bpm"):
             period = 60.0 / max(30, d["bpm"])
             beat = (time.time() % period) / period < 0.3
