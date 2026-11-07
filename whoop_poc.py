@@ -126,6 +126,8 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
             "SELECT hex FROM frames WHERE device_id=? AND inner_type=? AND unix BETWEEN ? AND ? ORDER BY unix",
             (dev[0], TYPE_HISTORICAL, since, until)).fetchall()
         last = conn.execute("SELECT max(recv_ms) FROM frames WHERE device_id=?", (dev[0],)).fetchone()[0]
+        newest = conn.execute("SELECT max(unix) FROM frames WHERE device_id=? AND inner_type=?",
+                              (dev[0], TYPE_HISTORICAL)).fetchone()[0]
         try:   # ground-truth labels written by `whoop_sync.py label` (e.g. activity=awake)
             labels = conn.execute("SELECT start_unix,end_unix,activity FROM labels WHERE device_id=? "
                                   "AND end_unix>=? AND start_unix<=?", (dev[0], since, until)).fetchall()
@@ -140,7 +142,8 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
             seen.add(s.unix)
             out.append(s)
     out.sort(key=lambda s: s.unix)
-    return out, {"address": dev[1], "name": dev[2], "last_sync": (last or 0) // 1000, "labels": labels}
+    return out, {"address": dev[1], "name": dev[2], "last_sync": (last or 0) // 1000, "newest_unix": newest,
+                 "labels": labels}
 
 
 def per_minute(samples: list[Sample]) -> list[Minute]:
@@ -301,7 +304,7 @@ def build_report(db: Path, hours: float, address: str | None, now: int | None = 
         samples = [s for s in demo_samples(until) if s.unix >= since]
         mins = per_minute(samples)
         staged = None if heuristic else run_stager(demo_payload(samples), mins)
-        return Report({"address": "-", "name": "DEMO — synthetic data, NOT your night", "last_sync": until,
+        return Report({"address": "-", "name": "DEMO — synthetic data, NOT your night", "last_sync": until, "newest_unix": until,
                        "labels": [], "sleep_source": "noop" if staged is not None else "heuristic"},
                       since, until, samples, mins, staged if staged is not None else detect_sleep(mins))
     samples, meta = load_samples(db, since, until + 300, address)
@@ -355,7 +358,11 @@ def dur(mins: int) -> str:
 
 def ago(t: int) -> str:
     s = max(0, int(time.time()) - t)
-    return f"{s}s ago" if s < 120 else f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago"
+    if s < 120:
+        return f"{s}s ago"
+    if s < 7200:
+        return f"{s // 60}m ago"
+    return f"{s // 3600}h ago" if s < 2 * 86400 else f"{s // 86400}d {s % 86400 // 3600}h ago"
 
 
 def spark(values: list[float | None], lo: float, hi: float) -> str:

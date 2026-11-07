@@ -53,6 +53,7 @@ class WhoopApp(App):
     DataTable { height: auto; max-height: 8; }
     """
     BINDINGS = [("q", "quit", "Quit"), ("r", "reload", "Reload"), ("s", "sync", "Sync strap now"),
+                ("w", "window", "Window 24h/3d/7d"),
                 ("d", "toggle_dark", "Dark/light")]
 
     def __init__(self, args) -> None:
@@ -82,6 +83,7 @@ class WhoopApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._drain = None if self.args.demo else core.drain_status()
         self.action_reload()
         self.set_interval(self.args.refresh, self.action_reload)
         self.poll_drain()
@@ -133,11 +135,19 @@ class WhoopApp(App):
                               severity="information" if ok else "error")
         self.call_from_thread(self.action_reload)
 
+    def action_window(self) -> None:
+        steps = (24, 72, 168)
+        self.args.hours = next((h for h in steps if h > self.args.hours), steps[0])
+        self.notify(f"Window: last {core.dur(int(self.args.hours * 60)).replace(' 00m', '')}")
+        self.action_reload()
+
     def render_report(self, r: core.Report) -> None:
         self.sub_title = r.meta.get("name") or r.meta["address"]
         self.query_one("#meta", Static).update(
-            f"window: last {(r.until - r.since) // 3600}h · last sync {core.stamp(r.meta['last_sync'])} "
-            f"({core.ago(r.meta['last_sync'])}) · auto-reload {self.args.refresh}s · "
+            f"window: last {(r.until - r.since) // 3600}h [dim](w to change)[/] · newest data "
+            f"{core.stamp(r.meta.get('newest_unix') or 0)}"
+            f"{' (' + core.ago(r.meta['newest_unix']) + ')' if r.meta.get('newest_unix') else ''} · "
+            f"auto-reload {self.args.refresh}s · "
             f"times in {datetime.now().astimezone().tzname()}")
 
         now, stats, hm = r.hr_now, r.hr_stats(), r.hr_minutes
@@ -155,7 +165,11 @@ class WhoopApp(App):
             for k in t:
                 t[k].show(k.upper(), "—", "")
             spark.data = []
-            axis.update("no heart-rate data in this window — wear the strap, then press s to sync")
+            d = self._drain
+            axis.update(f"nothing in this window yet: the drain has reached {d['at'][:-3]} and fills in "
+                        f"oldest → newest. Press w for a longer window." if d and d.get("at") else
+                        "no heart-rate data in this window: wear the strap, then press s to sync"
+                        if not self._drain else "nothing in this window yet: waiting for the drain to start")
 
         staged = r.meta.get("sleep_source") == "noop"
         self.query_one("#sleep-head", Static).update(
