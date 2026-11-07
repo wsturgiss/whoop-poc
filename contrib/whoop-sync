@@ -15,6 +15,8 @@
 # acked chunks. A drain that stops early (--max, SIGTERM, BLE drop, strap gone) loses nothing.
 # The next run picks up from the strap's cursor. Each `sync` attempt is recorded in
 # $XDG_STATE_HOME/whoop-poc/sync.json (outcome + time) so readers can tell "no new data" from "sync failing".
+# Battery: while connected, BlueZ reads the strap's standard Battery Service. During a sync we
+# sample it every 20 s into battery.json (no extra BLE session; the reading is as old as the last sync).
 set -euo pipefail
 umask 077   # state files (sync log, sync.json) are owner-only
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}/whoop-poc/env
@@ -41,6 +43,16 @@ record() {  # record <outcome> <exit> <frames> <started>
   mv -f "$STATE/sync.json.tmp" "$STATE/sync.json"
 }
 
+# battery.json: {"schema":1,"pct":N,"unix":T,"source":"bluez-battery-service"}; only when BlueZ has a value
+battery_once() {
+  local p
+  p=$(timeout 5 bluetoothctl info "$WHOOP_ADDRESS" 2>/dev/null \
+      | sed -n 's/.*Battery Percentage: .*(\([0-9]*\)).*/\1/p' | head -1) || true
+  [ -n "$p" ] || return 0
+  printf '{"schema":1,"pct":%s,"unix":%s,"source":"bluez-battery-service"}\n' "$p" "$(date +%s)" \
+    > "$STATE/battery.json.tmp" && mv -f "$STATE/battery.json.tmp" "$STATE/battery.json"
+}
+
 exec 9>"$LOCK"   # only one BLE session with the strap at a time
 case "$cmd" in
   status) need_addr; exec "${py[@]}" status --db "$DB" --address "$WHOOP_ADDRESS" "$@" ;;
@@ -55,9 +67,12 @@ case "$cmd" in
     mkdir -p "$STATE"
     log="$STATE/last-sync.log"
     # SIGTERM (systemd stop/timeout) reaches python directly via the cgroup; it stops, commits and decodes.
+    ( while sleep 20; do battery_once; done ) &
+    batt=$!
     set +e
     "${py[@]}" sync --model whoop4 --address "$WHOOP_ADDRESS" --subject me --db "$DB" --max "$MAX" "$@" 2>&1 | tee "$log"
     rc=${PIPESTATUS[0]}
+    kill "$batt" 2>/dev/null; wait "$batt" 2>/dev/null
     set -e
     frames=$(sed -n 's/^stored this run: \([0-9]*\) frames.*/\1/p' "$log" | tail -1)
     if grep -q 'could not find the strap advertising' "$log"; then outcome=not_advertising

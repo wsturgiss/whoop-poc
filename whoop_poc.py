@@ -604,6 +604,16 @@ def last_sync_attempt() -> dict | None:
         return None
 
 
+def last_battery() -> dict | None:
+    """Strap battery as last sampled by whoop-sync during a sync: {"pct", "unix", "source"} or None."""
+    import json
+    try:
+        b = json.loads((STATE_DIR / "battery.json").read_text())
+        return b if isinstance(b.get("pct"), int) and isinstance(b.get("unix"), int) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def snapshot(r: Report, now: int | None = None) -> dict:
     """Stable JSON document for other programs (e.g. Coach). Schema documented in COACH.md."""
     now = now or int(time.time())
@@ -641,6 +651,7 @@ def snapshot(r: Report, now: int | None = None) -> dict:
             "per_minute": [[m.t, round(m.hr, 1)] for m in r.hr_minutes],
         },
         "sleep": {"source": r.meta.get("sleep_source"), "sessions": sessions},
+        "battery": None if r.meta.get("address") == "-" else last_battery(),
         "labels": [{"start_unix": a, "end_unix": b, "activity": act} for a, b, act in r.meta.get("labels", [])],
     }
 

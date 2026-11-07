@@ -70,7 +70,7 @@ class WhoopApp(App):
             yield Static(id="drain")
             yield Static("HEART RATE", classes="h")
             with Horizontal(id="tiles"):
-                for i in ("now", "rest", "range", "worn"):
+                for i in ("now", "rest", "range", "worn", "batt"):
                     yield Tile(id=f"t-{i}")
             yield Sparkline([], id="hr-spark", summary_function=max)
             yield Static(id="hr-axis")
@@ -149,6 +149,13 @@ class WhoopApp(App):
             f"{' (' + core.ago(r.meta['newest_unix']) + ')' if r.meta.get('newest_unix') else ''} · "
             f"auto-reload {self.args.refresh}s · "
             f"times in {datetime.now().astimezone().tzname()}")
+
+        b, bt = (None if self.args.demo else core.last_battery()), self.query_one("#t-batt", Tile)
+        if b:
+            color = "red" if b["pct"] <= 15 else "yellow" if b["pct"] <= 30 else "green"
+            bt.show("STRAP BATTERY", f"[{color}]{b['pct']}%[/]", f"read {core.ago(b['unix'])}")
+        else:
+            bt.show("STRAP BATTERY", "—", "read during next sync")
 
         now, stats, hm = r.hr_now, r.hr_stats(), r.hr_minutes
         t = {k: self.query_one(f"#t-{k}", Tile) for k in ("now", "rest", "range", "worn")}

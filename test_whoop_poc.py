@@ -113,7 +113,8 @@ class Snapshot(unittest.TestCase):
         self.assertEqual(doc["schema"], "whoop-poc/snapshot@1")
         self.assertTrue(doc["demo"])
         self.assertEqual(set(doc), {"schema", "demo", "generated_unix", "generated_iso", "window", "device",
-                                    "freshness", "hr", "sleep", "labels"})
+                                    "freshness", "hr", "sleep", "battery", "labels"})
+        self.assertIsNone(doc["battery"])              # demo never reports the real strap's battery
         self.assertEqual(doc["hr"]["latest"]["unix"], doc["freshness"]["newest_sample_unix"])
         self.assertEqual(doc["sleep"]["source"], "heuristic")
         s = doc["sleep"]["sessions"][0]
@@ -149,3 +150,16 @@ class Drain(unittest.TestCase):
             self.assertEqual((s["phase"], s["pct"], s["at"], s["stored"]), ("draining", 63, "11-05 00:09:33", 2254))
             with mock.patch.object(w, "drain_running", return_value=False):
                 self.assertIsNone(w.drain_status())
+
+
+class Battery(unittest.TestCase):
+    def test_reads_and_rejects(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(w, "STATE_DIR", Path(d)):
+            self.assertIsNone(w.last_battery())
+            (Path(d) / "battery.json").write_text('{"schema":1,"pct":87,"unix":1793900000,"source":"bluez-battery-service"}')
+            self.assertEqual(w.last_battery()["pct"], 87)
+            (Path(d) / "battery.json").write_text('{"pct":"oops"}')
+            self.assertIsNone(w.last_battery())

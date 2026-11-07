@@ -59,6 +59,9 @@ biometric data: it lives outside the repo and is never committed.
     }]
   },
 
+  "battery": {"schema": 1, "pct": 100, "unix": …,                     // null if never read
+              "source": "bluez-battery-service"},                   // sampled during syncs; as old as `unix`
+
   "labels": [{"start_unix": …, "end_unix": …, "activity": "awake"}]     // ground truth from `whoop_sync.py label`
 }
 ```
