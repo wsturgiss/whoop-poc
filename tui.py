@@ -40,6 +40,7 @@ class WhoopApp(App):
     CSS = """
     Screen { padding: 0 1; }
     #meta { color: $text-muted; height: auto; margin-bottom: 1; }
+    #live { height: auto; border: round $error; padding: 0 1; display: none; }
     #drain { height: auto; color: $accent; border: round $accent; padding: 0 1; display: none; }
     .h { text-style: bold; color: $warning; margin-top: 1; height: auto; }
     #tiles { height: 5; }
@@ -52,7 +53,7 @@ class WhoopApp(App):
     DataTable { height: auto; max-height: 8; }
     """
     BINDINGS = [("q", "quit", "Quit"), ("r", "reload", "Reload"), ("s", "sync", "Sync strap now"),
-                ("w", "window", "Window 24h/3d/7d"),
+                ("w", "window", "Window 24h/3d/7d"), ("l", "live", "Live HR on/off"),
                 ("d", "toggle_dark", "Dark/light")]
 
     def __init__(self, args) -> None:
@@ -61,11 +62,15 @@ class WhoopApp(App):
         self._frame = 0
         self._drain: dict | None = None
         self._was_draining = False
+        self._live: dict | None = None
+        self._live_pending = 0.0        # until when a just-requested live session counts as starting
+        self._live_ours = False         # this TUI started it → stop it on quit (strap battery)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with VerticalScroll():
             yield Static(id="meta")
+            yield Static(id="live")
             yield Static(id="drain")
             yield Static("HEART RATE", classes="h")
             with Horizontal(id="tiles"):
@@ -101,11 +106,57 @@ class WhoopApp(App):
             self.action_reload()
             self.notify("Drain finished — data reloaded")
 
+    def action_live(self) -> None:
+        if self._live or time.time() < self._live_pending:
+            core.stop_live()
+            self._live_pending, self._live_ours = 0.0, False
+            self.notify("Live HR off")
+        else:
+            self.notify(core.start_live() + f" (auto-off after {core.LIVE_MINUTES} min)")
+            self._live_pending, self._live_ours = time.time() + 60, True
+        self.render_live()
+
+    async def action_quit(self) -> None:
+        if self._live_ours:                  # don't leave the strap streaming after we're gone
+            core.stop_live()
+        self.exit()
+
+    def render_live(self) -> None:
+        d, w = self._live, self.query_one("#live", Static)
+        pending = time.time() < self._live_pending
+        if not d and not pending:
+            w.display = False
+            return
+        w.display = True
+        if not d:
+            w.update("[b red]♥ LIVE HR[/]  [dim]starting… (waiting for the strap; a running sync saves first)[/]")
+            return
+        left = max(0, d["until_unix"] - int(time.time()))
+        tail = f"[dim]auto-off in {left // 60}:{left % 60:02d} · press l to stop[/]"
+        if d["state"] == "live" and d.get("bpm"):
+            period = 60.0 / max(30, d["bpm"])
+            beat = (time.time() % period) / period < 0.3
+            heart = "[b red]♥[/]" if beat else "[red]♡[/]"
+            stale = int(time.time()) - (d.get("unix") or 0)
+            age = f"  [dim]({stale}s old)[/]" if stale > 5 else ""
+            w.update(f"{heart} [b]LIVE[/]  [b red]{d['bpm']}[/] bpm{age}    {tail}")
+        else:
+            msg = {"connecting": "connecting to strap…", "waiting": "connected, waiting for heart rate (on your wrist?)",
+                   "reconnecting": "link dropped, reconnecting…"}.get(d["state"], d["state"])
+            w.update(f"[red]♡[/] [b]LIVE HR[/]  {msg}    {tail}")
+
     def animate_drain(self) -> None:
+        if self._frame % 3 == 0:
+            self._live = None if self.args.demo else core.live_status()
+            if self._live:
+                self._live_pending = 0.0
+            elif self._live_ours and time.time() >= self._live_pending:
+                self._live_ours = False          # it ended (time limit / dropped)
+        self.render_live()
         d, w = self._drain, self.query_one("#drain", Static)
+        self._frame += 1
         if not d:
             return
-        self._frame += 1
         spin = SPINNER[self._frame % len(SPINNER)]
         label = {"draining": "DRAINING STRAP", "connecting": "CONNECTING TO STRAP",
                  "reconnecting": "RECONNECTING (BLE dropped, resuming)", "finishing": "SAVING + DECODING"}[d["phase"]]

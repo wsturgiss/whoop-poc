@@ -39,6 +39,12 @@ whoop-sync status
 (`whoop-sync battery` does it by hand) into `~/.local/state/whoop-poc/battery.json`. The standard BLE
 Battery Service reports a flat 100% on this strap and is ignored.
 
+**Live HR** (`l` in the TUI, or `whoop-sync live --minutes N`): streams heart rate over the standard
+BLE Heart Rate characteristic, with only WHOOP's realtime-HR toggle armed. NOOP's full realtime stream
+(R-R + raw IMU) is used only as a fallback. Holding the link open costs strap battery, so it always
+auto-stops (10 min by default), and the TUI stops it when you quit. While it runs it holds the strap, so
+timer syncs skip. Pressing `l` during a drain pauses the drain, which resumes on the next timer run.
+
 **Stopping a drain** (`systemctl --user stop whoop-sync`, Ctrl+C) is safe: the drain saves, decodes and is
 recorded as `partial`, and the next run resumes.
 
@@ -48,7 +54,7 @@ Bluetooth off), being out of range, or the strap idling. The timer just retries.
 ## Run
 
 ```bash
-uv run whoop-poc              # TUI   (q quit · r reload · s sync strap · d dark/light)
+uv run whoop-poc              # TUI   (q quit · r reload · s sync · l live HR · w window · d dark/light)
 uv run whoop-poc html         # writes out/whoop.html → open it in a browser
 uv run whoop-poc html --watch # regenerate every 30s (page auto-refreshes)
 uv run whoop-poc summary      # plain text

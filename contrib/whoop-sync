@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # whoop-sync: wrapper around NOOP's linux-capture whoop_sync.py for one paired WHOOP 4.0 strap.
 #
-#   whoop-sync [sync|battery|realtime|status|decode|export|label|devices] [extra whoop_sync.py args...]
+#   whoop-sync [sync|battery|live [--minutes N]|realtime|status|decode|export|label|devices] [extra whoop_sync.py args...]
 #
 # Config (not in git): ~/.config/whoop-poc/env, sourced if present. Keys:
 #   WHOOP_ADDRESS       strap BLE MAC (required for sync/realtime/status)
@@ -84,6 +84,13 @@ case "$cmd" in
     else outcome=unknown; fi
     record "$outcome" "$rc" "${frames:-0}" "$started"
     exit "$rc" ;;
+  live)
+    # Live HR for a limited time (default 10 min; costs strap battery). Waits briefly for the lock so a
+    # drain that was just asked to stop can save + decode first. Holds the lock while live: timer syncs skip.
+    need_addr
+    flock -w 45 9 || { echo "whoop-sync: strap busy (a sync is running); try again shortly"; exit 1; }
+    mkdir -p "$STATE"
+    exec .venv/bin/python "$HERE/whoop_live.py" --address "$WHOOP_ADDRESS" --out "$STATE/live.json" "$@" ;;
   battery)
     need_addr
     flock -n 9 || { echo "whoop-sync: a sync holds the strap; the battery is read when it finishes"; exit 0; }

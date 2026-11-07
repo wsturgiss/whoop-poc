@@ -663,6 +663,10 @@ _PROGRESS = re.compile(r"sync \S+\s+(\d+)%.*?@(\d\d-\d\d \d\d:\d\d:\d\d)\s+([\d.
 
 def drain_running() -> bool:
     """True while any `whoop_sync.py sync` process is alive (TUI `s`, timer, or manual)."""
+    return drain_pid() is not None
+
+
+def drain_pid() -> int | None:
     for p in Path("/proc").iterdir():
         if not p.name.isdigit():
             continue
@@ -671,8 +675,53 @@ def drain_running() -> bool:
         except OSError:
             continue
         if any(a.endswith(b"whoop_sync.py") for a in argv) and b"sync" in argv:
-            return True
-    return False
+            return int(p.name)
+    return None
+
+
+# ------------------------------------------------------------------------------------- live HR
+LIVE_MINUTES = 10      # live HR holds a BLE link open (strap battery), so it always auto-stops
+
+
+def _alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def live_status() -> dict | None:
+    """live.json from `whoop-sync live` while that process is running, else None."""
+    import json
+    try:
+        d = json.loads((STATE_DIR / "live.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return d if d.get("state") != "ended" and _alive(d.get("pid")) else None
+
+
+def start_live(minutes: float = LIVE_MINUTES) -> str:
+    """Start live HR detached. A running drain is asked to stop first (it saves, decodes and resumes on
+    the next timer run); `whoop-sync live` waits for the strap lock until it has."""
+    import signal
+    msg = "Live HR starting"
+    if (pid := drain_pid()) is not None:
+        os.kill(pid, signal.SIGTERM)
+        msg = "Pausing the sync (it resumes later); live HR starting"
+    (STATE_DIR / "live.json").unlink(missing_ok=True)
+    subprocess.Popen(["whoop-sync", "live", "--minutes", str(minutes)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return msg
+
+
+def stop_live() -> bool:
+    import signal
+    d = live_status()
+    if not d:
+        return False
+    os.kill(int(d["pid"]), signal.SIGTERM)
+    return True
 
 
 def drain_status() -> dict | None:
