@@ -605,11 +605,13 @@ def last_sync_attempt() -> dict | None:
 
 
 def last_battery() -> dict | None:
-    """Strap battery as last sampled by whoop-sync during a sync: {"pct", "unix", "source"} or None."""
+    """Strap battery from WHOOP's GET_BATTERY_LEVEL, read by whoop-sync after each sync, or None.
+    Readings from the standard BLE Battery Service (flat 100%, untrustworthy) are ignored."""
     import json
     try:
         b = json.loads((STATE_DIR / "battery.json").read_text())
-        return b if isinstance(b.get("pct"), int) and isinstance(b.get("unix"), int) else None
+        ok = isinstance(b.get("pct"), int) and isinstance(b.get("unix"), int) and b.get("source") == "whoop-cmd-26"
+        return b if ok else None
     except (OSError, ValueError, AttributeError):
         return None
 

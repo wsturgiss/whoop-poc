@@ -153,7 +153,7 @@ class WhoopApp(App):
             color = "red" if b["pct"] <= 15 else "yellow" if b["pct"] <= 30 else "green"
             bt.show("STRAP BATTERY", f"[{color}]{b['pct']}%[/]", f"read {core.ago(b['unix'])}")
         else:
-            bt.show("STRAP BATTERY", "—", "read during next sync")
+            bt.show("STRAP BATTERY", "—", "read after next sync")
 
         now, stats, hm = r.hr_now, r.hr_stats(), r.hr_minutes
         t = {k: self.query_one(f"#t-{k}", Tile) for k in ("now", "rest", "range", "worn")}

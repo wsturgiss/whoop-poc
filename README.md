@@ -35,6 +35,13 @@ journalctl --user -u whoop-sync -n 40
 whoop-sync status
 ```
 
+**Battery:** each sync first reads the strap battery with WHOOP's own `GET_BATTERY_LEVEL` command
+(`whoop-sync battery` does it by hand) into `~/.local/state/whoop-poc/battery.json`. The standard BLE
+Battery Service reports a flat 100% on this strap and is ignored.
+
+**Stopping a drain** (`systemctl --user stop whoop-sync`, Ctrl+C) is safe: the drain saves, decodes and is
+recorded as `partial`, and the next run resumes.
+
 `not_advertising` means the strap wasn't connectable. The usual causes are the phone's WHOOP app holding it (turn phone
 Bluetooth off), being out of range, or the strap idling. The timer just retries.
 

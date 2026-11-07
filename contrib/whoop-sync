@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # whoop-sync: wrapper around NOOP's linux-capture whoop_sync.py for one paired WHOOP 4.0 strap.
 #
-#   whoop-sync [sync|realtime|status|decode|export|label|devices] [extra whoop_sync.py args...]
+#   whoop-sync [sync|battery|realtime|status|decode|export|label|devices] [extra whoop_sync.py args...]
 #
 # Config (not in git): ~/.config/whoop-poc/env, sourced if present. Keys:
 #   WHOOP_ADDRESS       strap BLE MAC (required for sync/realtime/status)
@@ -15,8 +15,9 @@
 # acked chunks. A drain that stops early (--max, SIGTERM, BLE drop, strap gone) loses nothing.
 # The next run picks up from the strap's cursor. Each `sync` attempt is recorded in
 # $XDG_STATE_HOME/whoop-poc/sync.json (outcome + time) so readers can tell "no new data" from "sync failing".
-# Battery: while connected, BlueZ reads the strap's standard Battery Service. During a sync we
-# sample it every 20 s into battery.json (no extra BLE session; the reading is as old as the last sync).
+# Battery: before each drain, whoop_battery.py (under the lock) sends WHOOP's GET_BATTERY_LEVEL and
+# writes battery.json, so the reading lands in seconds even if the drain then runs long or is cut off. The standard BLE Battery Service read a flat 100%, so it is
+# only kept there as `bas_pct` for comparison. `whoop-sync battery` runs the same probe by hand.
 set -euo pipefail
 umask 077   # state files (sync log, sync.json) are owner-only
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}/whoop-poc/env
@@ -26,6 +27,7 @@ DIR=${WHOOP_CAPTURE_DIR:-$HOME/src/noop/tools/linux-capture}
 DB=${WHOOP_DB:-captures/whoop.db}
 MAX=${WHOOP_SYNC_MAX:-1200}
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/whoop-poc
+HERE=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")   # contrib/ (whoop_battery.py lives next to us)
 LOCK=${XDG_RUNTIME_DIR:-/tmp}/whoop-sync.lock
 export WHOOP_DECODE=${WHOOP_DECODE:-$HOME/src/noop/Packages/WhoopProtocol/.build/release/whoop-decode}
 
@@ -43,14 +45,8 @@ record() {  # record <outcome> <exit> <frames> <started>
   mv -f "$STATE/sync.json.tmp" "$STATE/sync.json"
 }
 
-# battery.json: {"schema":1,"pct":N,"unix":T,"source":"bluez-battery-service"}; only when BlueZ has a value
-battery_once() {
-  local p
-  p=$(timeout 5 bluetoothctl info "$WHOOP_ADDRESS" 2>/dev/null \
-      | sed -n 's/.*Battery Percentage: .*(\([0-9]*\)).*/\1/p' | head -1) || true
-  [ -n "$p" ] || return 0
-  printf '{"schema":1,"pct":%s,"unix":%s,"source":"bluez-battery-service"}\n' "$p" "$(date +%s)" \
-    > "$STATE/battery.json.tmp" && mv -f "$STATE/battery.json.tmp" "$STATE/battery.json"
+battery_probe() {
+  timeout 90 .venv/bin/python "$HERE/whoop_battery.py" --address "$WHOOP_ADDRESS" --out "$STATE/battery.json" "$@"
 }
 
 exec 9>"$LOCK"   # only one BLE session with the strap at a time
@@ -66,13 +62,19 @@ case "$cmd" in
     started=$(date +%s)
     mkdir -p "$STATE"
     log="$STATE/last-sync.log"
-    # SIGTERM (systemd stop/timeout) reaches python directly via the cgroup; it stops, commits and decodes.
-    ( while sleep 20; do battery_once; done ) &
-    batt=$!
+    : > "$log"
+    # Quick battery read first (one short connection, 1 acquire try); if the strap isn't reachable the
+    # drain's own acquire below still retries, so this never costs a sync.
+    # Stop requests (systemd stop/timeout sends SIGTERM to the whole cgroup; Ctrl+C sends SIGINT to the
+    # process group) must not kill this wrapper or the log tee: python handles them itself by stopping,
+    # committing and decoding, and needs its stdout alive to finish. We then still record the outcome.
+    # (A trapped signal is reset to default in children, so python and the probe still receive it.)
+    trap 'echo "whoop-sync: stop requested; letting the drain save + decode"' TERM INT
+    logtee() { ( trap '' TERM INT; exec tee -a "$log" ); }
+    battery_probe --tries 1 2>&1 | logtee || true
     set +e
-    "${py[@]}" sync --model whoop4 --address "$WHOOP_ADDRESS" --subject me --db "$DB" --max "$MAX" "$@" 2>&1 | tee "$log"
+    "${py[@]}" sync --model whoop4 --address "$WHOOP_ADDRESS" --subject me --db "$DB" --max "$MAX" "$@" 2>&1 | logtee
     rc=${PIPESTATUS[0]}
-    kill "$batt" 2>/dev/null; wait "$batt" 2>/dev/null
     set -e
     frames=$(sed -n 's/^stored this run: \([0-9]*\) frames.*/\1/p' "$log" | tail -1)
     if grep -q 'could not find the strap advertising' "$log"; then outcome=not_advertising
@@ -82,5 +84,10 @@ case "$cmd" in
     else outcome=unknown; fi
     record "$outcome" "$rc" "${frames:-0}" "$started"
     exit "$rc" ;;
+  battery)
+    need_addr
+    flock -n 9 || { echo "whoop-sync: a sync holds the strap; the battery is read when it finishes"; exit 0; }
+    mkdir -p "$STATE"
+    battery_probe "$@" ;;
   *) exec "${py[@]}" "$cmd" "$@" ;;
 esac

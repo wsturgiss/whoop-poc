@@ -59,8 +59,9 @@ biometric data: it lives outside the repo and is never committed.
     }]
   },
 
-  "battery": {"schema": 1, "pct": 100, "unix": …,                     // null if never read
-              "source": "bluez-battery-service"},                   // sampled during syncs; as old as `unix`
+  "battery": {"schema": 1, "pct": 67, "pct_exact": 67.3, "mv": 3912,  // null if never read
+              "unix": …, "source": "whoop-cmd-26",                  // WHOOP GET_BATTERY_LEVEL, read after each sync
+              "bas_pct": 100},                                       // standard BLE Battery Service, NOT trustworthy (reads 100)
 
   "labels": [{"start_unix": …, "end_unix": …, "activity": "awake"}]     // ground truth from `whoop_sync.py label`
 }

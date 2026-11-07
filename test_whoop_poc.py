@@ -159,7 +159,9 @@ class Battery(unittest.TestCase):
         from unittest import mock
         with tempfile.TemporaryDirectory() as d, mock.patch.object(w, "STATE_DIR", Path(d)):
             self.assertIsNone(w.last_battery())
-            (Path(d) / "battery.json").write_text('{"schema":1,"pct":87,"unix":1793900000,"source":"bluez-battery-service"}')
-            self.assertEqual(w.last_battery()["pct"], 87)
+            (Path(d) / "battery.json").write_text('{"schema":1,"pct":100,"unix":1793900000,"source":"bluez-battery-service"}')
+            self.assertIsNone(w.last_battery())        # standard BLE service reading: untrustworthy
+            (Path(d) / "battery.json").write_text('{"schema":1,"pct":67,"unix":1793900000,"source":"whoop-cmd-26"}')
+            self.assertEqual(w.last_battery()["pct"], 67)
             (Path(d) / "battery.json").write_text('{"pct":"oops"}')
             self.assertIsNone(w.last_battery())
