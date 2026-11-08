@@ -321,8 +321,10 @@ class WhoopApp(App):
             bar = "".join(" " if not b else "█" if sum(m.asleep for m in b) * 2 >= len(b) else "[dim]░[/]"
                           for b in bins)
             legend_txt = "█ still + calm HR (≈asleep)   ░ restless / awake"
-        ticks, labels = core.hour_axis(last.start, last.end, width)
-        hyp.update(f"latest window  {core.window_label(last.start, last.end)}\n{bar}\n[dim]{ticks}\n{labels}[/]")
+        ticks, labels = core.hour_axis(last.start, last.end, width, ends=True)
+        if width >= 12:                     # exact start/end bold, hour markers dim
+            labels = f"[b]{labels[:5]}[/][dim]{labels[5:-5]}[/][b]{labels[-5:]}[/]"
+        hyp.update(f"latest window  {core.window_label(last.start, last.end)}\n{bar}\n[dim]{ticks}[/]\n{labels}")
         legend.update(legend_txt)
 
 

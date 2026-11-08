@@ -360,9 +360,11 @@ def stage_bar(s: "SleepWindow", width: int, markup: bool = False) -> str:
     return "".join(out)
 
 
-def hour_axis(start: int, end: int, width: int) -> tuple[str, str]:
+def hour_axis(start: int, end: int, width: int, ends: bool = False) -> tuple[str, str]:
     """(tick row, label row) aligned to a `width`-column timeline spanning start→end: a tick under the
-    column where each whole hour falls, labelled HH:00. Uses every 2nd/3rd/… hour if labels would collide."""
+    column where each whole hour falls, labelled HH:00. Uses every 2nd/3rd/… hour if labels would collide.
+    ends=True also labels the exact start (left edge) and end (right-aligned) times; hour labels that
+    would collide with those are dropped (their ticks stay)."""
     step = max(1e-9, (end - start) / max(1, width))
     first = (start // 3600 + 1) * 3600
     hours = list(range(first, end + 1, 3600))
@@ -372,14 +374,22 @@ def hour_axis(start: int, end: int, width: int) -> tuple[str, str]:
         if all(b - a >= 6 for a, b in zip(cols, cols[1:])):
             break
     ticks, labels = [" "] * width, [" "] * width
-    free = 0                                     # first label column not yet used (keeps a 1-col gap)
+    free, limit = 0, width                       # label columns [free, limit) are still available
+    if ends and width >= 12:
+        a, b = hhmm(start), hhmm(end)
+        ticks[0], ticks[width - 1] = "╵", "╵"
+        labels[:len(a)] = a
+        labels[width - len(b):] = b
+        free, limit = len(a) + 1, width - len(b) - 1
     for t, c in zip(picks, cols):
-        if not 0 <= c < width:
-            continue
+        if not 0 <= c < width or (ends and (c <= 2 or c >= width - 3)):
+            continue                             # no hour tick crowding the start/end ticks
         ticks[c] = "╵"
         lab = datetime.fromtimestamp(t).strftime("%H:%M")
-        at = min(c, width - len(lab))            # a label at the right edge ends at the edge
-        if at >= free:
+        # Without end labels, a label at the right edge may end at the edge; with them, every hour
+        # label sits exactly under its tick or is dropped (the tick stays).
+        at = c if ends else min(c, limit - len(lab))
+        if at >= free and at + len(lab) <= limit:
             labels[at:at + len(lab)] = lab
             free = at + len(lab) + 1
     return "".join(ticks), "".join(labels)

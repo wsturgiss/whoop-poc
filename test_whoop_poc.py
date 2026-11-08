@@ -229,3 +229,22 @@ class HourAxis(unittest.TestCase):
         self.assertEqual(c, int((ts(2026, 11, 8, 0, 0) - start) / ((end - start) / 120)))
         narrow, _ = w.hour_axis(start, end, 30)                             # 8 labels won't fit in 30
         self.assertLess(narrow.count("╵"), 8)
+
+
+class HourAxisEnds(unittest.TestCase):
+    def test_start_end_labels(self):
+        from datetime import datetime
+        ts = lambda *a: int(datetime(*a).timestamp())
+        start, end = ts(2026, 11, 7, 23, 28), ts(2026, 11, 8, 7, 5)
+        ticks, labels = w.hour_axis(start, end, 110, ends=True)
+        self.assertTrue(labels.startswith("23:28 "))
+        self.assertTrue(labels.endswith(" 07:05"))
+        self.assertNotIn("07:00", labels)              # would collide with the end label
+        self.assertEqual((ticks[0], ticks[-1]), ("╵", "╵"))
+        self.assertEqual(len(labels), 110)
+        self.assertNotIn("╵╵", ticks)                  # no hour tick jammed against an end tick
+        for width in (30, 60, 110):                    # every hour label sits exactly under a tick
+            ticks, labels = w.hour_axis(start, end, width, ends=True)
+            import re
+            for m in re.finditer(r"\d\d:\d\d", labels):
+                self.assertEqual(ticks[m.start()] if m.start() < width - 5 else ticks[-1], "╵", (width, m.group()))
