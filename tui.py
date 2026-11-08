@@ -313,7 +313,7 @@ class WhoopApp(App):
             bar = "".join(" " if not b else "█" if sum(m.asleep for m in b) * 2 >= len(b) else "[dim]░[/]"
                           for b in bins)
             legend_txt = "█ still + calm HR (≈asleep)   ░ restless / awake"
-        hyp.update(f"latest window  {core.hhmm(last.start)} → {core.hhmm(last.end)}\n{bar}")
+        hyp.update(f"latest window  {core.window_label(last.start, last.end)}\n{bar}")
         legend.update(legend_txt)
 
 

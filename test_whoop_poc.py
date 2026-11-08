@@ -200,3 +200,16 @@ class LiveGaps(unittest.TestCase):
         s2 = [(1000 + t, 70) for t in list(range(0, 40)) + list(range(80, 120))]   # 40 s dropout
         cols2 = self._bar_cols(w.live_chart(s2, 124, 4, 185))
         self.assertFalse(all(cols2), "a long dropout must stay visible")
+
+
+class WindowLabel(unittest.TestCase):
+    def test_dates_and_relative_day(self):
+        from datetime import datetime
+        ts = lambda *a: int(datetime(*a).timestamp())
+        start, end = ts(2026, 11, 6, 23, 7), ts(2026, 11, 7, 5, 55)
+        self.assertEqual(w.window_label(start, end, ts(2026, 11, 7, 9, 0)),
+                         "Fri Nov 06 23:07 → Sat Nov 07 05:55 · ended this morning")
+        self.assertTrue(w.window_label(start, end, ts(2026, 11, 8, 9, 0)).endswith("ended yesterday"))
+        self.assertTrue(w.window_label(start, end, ts(2026, 11, 10, 9, 0)).endswith("ended 3 days ago"))
+        nap = w.window_label(ts(2026, 11, 7, 13, 0), ts(2026, 11, 7, 14, 30), ts(2026, 11, 7, 18, 0))
+        self.assertEqual(nap, "Sat Nov 07 13:00 → 14:30 · ended today")

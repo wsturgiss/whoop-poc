@@ -368,6 +368,17 @@ def stamp(t: int) -> str:
     return datetime.fromtimestamp(t).strftime("%a %b %d %H:%M") if t else "never"
 
 
+def window_label(start: int, end: int, now: int | None = None) -> str:
+    """'Fri Nov 06 23:07 → Sat Nov 07 05:55 · ended yesterday' (end date shown only if it differs)."""
+    a, b = datetime.fromtimestamp(start), datetime.fromtimestamp(end)
+    today = datetime.fromtimestamp(now or time.time()).date()
+    end_s = b.strftime("%H:%M") if a.date() == b.date() else b.strftime("%a %b %d %H:%M")
+    days = (today - b.date()).days
+    when = ("this morning" if b.hour < 12 else "today") if days == 0 else \
+        "yesterday" if days == 1 else f"{days} days ago"
+    return f"{a.strftime('%a %b %d %H:%M')} → {end_s} · ended {when}"
+
+
 def dur(mins: int) -> str:
     return f"{mins // 60}h {mins % 60:02d}m"
 
