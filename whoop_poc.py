@@ -27,6 +27,22 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+def _load_config() -> None:
+    """Fill os.environ from ~/.config/whoop-poc/env (KEY=VALUE lines, the file whoop-sync sources) for
+    keys not already set, so the TUI and whoop-sync share one config (WHOOP_MAX_HR, WHOOP_LIVE_MINUTES…)."""
+    p = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "whoop-poc" / "env"
+    try:
+        lines = p.read_text().splitlines()
+    except OSError:
+        return
+    for ln in lines:
+        k, sep, v = ln.strip().partition("=")
+        if sep and k and not k.startswith("#") and k.isidentifier():
+            os.environ.setdefault(k, v.strip().strip("'\""))
+
+
+_load_config()
+
 DEFAULT_DB = Path(os.environ.get(
     "WHOOP_DB", "~/src/noop/tools/linux-capture/captures/whoop.db")).expanduser()
 

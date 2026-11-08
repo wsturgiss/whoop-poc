@@ -45,7 +45,7 @@ this strap because its HR-broadcast profile is off. NOOP's full realtime stream 
 as a fallback. Holding the link open costs strap battery, so it always
 auto-stops: 30 min by default (`WHOOP_LIVE_MINUTES`), `+` in the TUI adds 10 min (3 h cap), and the TUI
 stops it when you quit. The live panel graphs the session as it goes, one bar per time slice colored by HR zone (Z1–Z5 at
-50/60/70/80/90% of max HR, set `WHOOP_MAX_HR`, default 190), with a key showing each zone's bpm range and
+50/60/70/80/90% of max HR: `WHOOP_MAX_HR` in `~/.config/whoop-poc/env`, default 190), with a key showing each zone's bpm range and
 time spent in it. After the session ends, the graph stays up as a summary. While it runs it holds the strap, so
 timer syncs skip. Pressing `l` during a drain pauses the drain, which resumes on the next timer run.
 
