@@ -59,9 +59,10 @@ class WhoopApp(App):
                 ("plus", "extend_live", "+10 min live"),
                 ("d", "toggle_dark", "Dark/light")]
 
-    def __init__(self, args) -> None:
+    def __init__(self, args, pool=None) -> None:
         super().__init__()
         self.args = args
+        self._pool = pool                       # report-builder worker process (see make_report_pool)
         self._frame = 0
         self._drain: dict | None = None
         self._was_draining = False
@@ -70,6 +71,9 @@ class WhoopApp(App):
         self._live_ours = False         # this TUI started it → stop it on quit (strap battery)
         self._live_stopping = None      # pid we asked to stop (it takes a few s to switch the stream off)
         self._live_drawn, self._live_drawn_at = False, 0.0
+        self._report: core.Report | None = None
+        self._building = self._rebuild = False
+        self._exiting = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -132,8 +136,11 @@ class WhoopApp(App):
             self.notify("Live HR isn't on (press l)", severity="warning")
 
     async def action_quit(self) -> None:
+        self._exiting = True
         if self._live_ours:                  # don't leave the strap streaming after we're gone
             core.stop_live()
+        if self._pool is not None:           # don't wait for an in-flight build; the worker exits after it
+            self._pool.shutdown(wait=False, cancel_futures=True)
         self.exit()
 
     def render_live(self) -> None:
@@ -226,8 +233,54 @@ class WhoopApp(App):
         w.display = True
 
     def action_reload(self) -> None:
-        self._report = core.build_report(self.args.db, self.args.hours, self.args.address, demo=self.args.demo)
-        self.render_report(self._report)
+        """Rebuild the report in a persistent worker process (0.3–4 s of decoding + NOOP's stager). A
+        thread wasn't enough: the decoding holds Python's GIL and stalled the UI up to ~0.9 s. The worker
+        keeps its stager cache between reloads. Requests during a build coalesce into one more build."""
+        if self._building:
+            self._rebuild = True
+            return
+        self._building, self._rebuild = True, False
+        hours = self.args.hours
+        self.render_meta_loading()
+        args = (core.build_report_slim, self.args.db, hours, self.args.address)
+        try:
+            fut = self._pool.submit(*args, demo=self.args.demo) if self._pool else None
+        except Exception:                       # worker died / pool broken: fall back to a thread
+            self._pool = None
+            fut = None
+        if fut is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._threads = getattr(self, "_threads", None) or ThreadPoolExecutor(1)
+            fut = self._threads.submit(*args, demo=self.args.demo)
+
+        def done(f) -> None:                    # runs on the pool's thread: hand back to the UI
+            if self._exiting or not self.is_running or f.cancelled():
+                return                          # quit mid-build: nothing left to hand the result to
+            try:
+                r = f.result()
+            except BaseException as e:
+                r = e
+            try:
+                self.call_from_thread(self._report_ready, r, hours)
+            except RuntimeError:                # app already exited
+                pass
+
+        fut.add_done_callback(done)
+
+    def _report_ready(self, r, hours) -> None:
+        self._building = False
+        if isinstance(r, BaseException):
+            self.notify(f"Reload failed: {r}", severity="error")
+        elif hours == self.args.hours:          # drop a result for a window the user already left
+            self._report = r
+            self.render_report(r)
+        if self._rebuild or hours != self.args.hours:
+            self.action_reload()
+
+    def render_meta_loading(self) -> None:
+        if getattr(self, "_report", None) is None or self._report.until - self._report.since != int(self.args.hours * 3600):
+            self.query_one("#meta", Static).update(
+                f"[b]loading last {core.dur(int(self.args.hours * 60)).replace(' 00m', '')}…[/]")
 
     def on_resize(self, _event) -> None:
         # Width-dependent pieces (sleep timeline, hour axis) were sized for the old width: redraw now
@@ -328,5 +381,24 @@ class WhoopApp(App):
         legend.update(legend_txt)
 
 
+def make_report_pool():
+    """One-worker process pool for report builds, started BEFORE Textual takes over stdout/stderr
+    (spawning from inside a running app fails: Textual's stream stand-ins have no file descriptor).
+    The worker is spawned eagerly so later submits need no new process. None if it can't start."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    try:
+        pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+        pool.submit(int).result(timeout=20)     # spawn + import the worker now
+        return pool
+    except Exception:
+        return None
+
+
 def run_tui(args) -> None:
-    WhoopApp(args).run()
+    pool = make_report_pool()
+    try:
+        WhoopApp(args, pool).run()
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)

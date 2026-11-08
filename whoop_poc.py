@@ -252,6 +252,11 @@ def demo_samples(end: int) -> list[Sample]:
     return out
 
 
+_STAGE_CACHE: dict[tuple, tuple[float, list]] = {}
+STAGE_CACHE_S = 600     # the stager re-stages every night in the window (seconds of CPU), but past nights
+#                         don't change: reuse its output until new decoded data lands or this long passes
+
+
 def noop_stage(db: Path, since: int, until: int, address: str | None, mins: list[Minute],
                labels=()) -> list[SleepWindow] | None:
     """Run NOOP's SleepStager (via stager/whoop-stage) on NOOP's decoded feat_* tables.
@@ -262,26 +267,40 @@ def noop_stage(db: Path, since: int, until: int, address: str | None, mins: list
     try:
         dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
                            + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
-        sec = conn.execute("SELECT unix,hr,gx,gy,gz,resp_raw FROM feat_second WHERE device_id=? "
-                           "AND unix BETWEEN ? AND ? ORDER BY unix", (dev[0], since, until)).fetchall()
-        rr = conn.execute("SELECT unix,rr_ms FROM feat_rr WHERE device_id=? AND unix BETWEEN ? AND ? "
-                          "ORDER BY unix,idx", (dev[0], since, until)).fetchall()
+        newest = conn.execute("SELECT max(unix) FROM feat_second WHERE device_id=? AND unix BETWEEN ? AND ?",
+                              (dev[0], since, until)).fetchone()[0]
+        if newest is None:
+            return None
+        key = (str(db), dev[0], (until - since) // 60, newest)
+        hit = _STAGE_CACHE.get(key)
+        if hit and time.time() - hit[0] < STAGE_CACHE_S:
+            raw = hit[1]
+        else:
+            sec = conn.execute("SELECT unix,hr,gx,gy,gz,resp_raw FROM feat_second WHERE device_id=? "
+                               "AND unix BETWEEN ? AND ? ORDER BY unix", (dev[0], since, until)).fetchall()
+            rr = conn.execute("SELECT unix,rr_ms FROM feat_rr WHERE device_id=? AND unix BETWEEN ? AND ? "
+                              "ORDER BY unix,idx", (dev[0], since, until)).fetchall()
+            raw = stager_raw({
+                "hr": [{"ts": u, "bpm": h} for u, h, *_ in sec if h],
+                "gravity": [{"ts": u, "x": x, "y": y, "z": z} for u, _, x, y, z, _ in sec if x is not None],
+                "resp": [{"ts": u, "raw": r} for u, *_, r in sec if r is not None],
+                "rr": [{"ts": u, "rrMs": v} for u, v in rr],
+                "tzOffsetSeconds": int(datetime.fromtimestamp(until).astimezone().utcoffset().total_seconds()),
+            })
+            if raw is None:
+                return None
+            for k in [k for k in _STAGE_CACHE if k[:3] == key[:3]]:     # keep one entry per window size
+                del _STAGE_CACHE[k]
+            _STAGE_CACHE[key] = (time.time(), raw)
     except sqlite3.OperationalError:     # NOOP decode never ran on this DB
         return None
     finally:
         conn.close()
-    if not sec:
-        return None
-    return run_stager({
-        "hr": [{"ts": u, "bpm": h} for u, h, *_ in sec if h],
-        "gravity": [{"ts": u, "x": x, "y": y, "z": z} for u, _, x, y, z, _ in sec if x is not None],
-        "resp": [{"ts": u, "raw": r} for u, *_, r in sec if r is not None],
-        "rr": [{"ts": u, "rrMs": v} for u, v in rr],
-        "tzOffsetSeconds": int(datetime.fromtimestamp(until).astimezone().utcoffset().total_seconds()),
-    }, mins, labels)
+    return stager_windows(raw, mins, labels)
 
 
-def run_stager(payload: dict, mins: list[Minute], labels=()) -> list[SleepWindow] | None:
+def stager_raw(payload: dict) -> list | None:
+    """NOOP SleepStager sessions as JSON (whoop-stage's stdout), or None if it failed / isn't built."""
     import json
     if not STAGER_BIN.exists():
         return None
@@ -289,9 +308,13 @@ def run_stager(payload: dict, mins: list[Minute], labels=()) -> list[SleepWindow
     if res.returncode != 0:
         print(f"whoop-stage failed: {res.stderr.strip()[:200]}", file=sys.stderr)
         return None
+    return json.loads(res.stdout)
+
+
+def stager_windows(raw: list, mins: list[Minute], labels=()) -> list[SleepWindow]:
     awake = [(a, b) for a, b, act in labels if act.lower() in ("awake", "wake")]
     out = []
-    for s in json.loads(res.stdout):
+    for s in raw:
         span = max(1, s["end"] - s["start"])
         covered = sum(max(0, min(b, s["end"]) - max(a, s["start"])) for a, b in awake)
         if covered * 2 > span:          # ground truth says he was awake for most of it
@@ -299,6 +322,11 @@ def run_stager(payload: dict, mins: list[Minute], labels=()) -> list[SleepWindow
         out.append(SleepWindow(s["start"], s["end"], [m for m in mins if s["start"] <= m.t < s["end"]],
                                stages=s["stages"], resting_hr=s.get("restingHR"), avg_hrv=s.get("avgHRV")))
     return out
+
+
+def run_stager(payload: dict, mins: list[Minute], labels=()) -> list[SleepWindow] | None:
+    raw = stager_raw(payload)
+    return None if raw is None else stager_windows(raw, mins, labels)
 
 
 def demo_payload(samples: list[Sample]) -> dict:
@@ -329,6 +357,14 @@ def build_report(db: Path, hours: float, address: str | None, now: int | None = 
     meta["sleep_source"] = "noop" if staged is not None else "heuristic"
     sleep = staged if staged is not None else detect_sleep(mins, meta["labels"])
     return Report(meta, since, until, samples, mins, sleep)
+
+
+def build_report_slim(*args, **kw) -> Report:
+    """build_report without the per-second samples (only the latest worn one, for hr_now), so it is cheap
+    to pickle back from the TUI's worker process."""
+    r = build_report(*args, **kw)
+    r.samples = [s for s in (r.hr_now,) if s is not None]
+    return r
 
 
 # ------------------------------------------------------------------------------------- formatting
