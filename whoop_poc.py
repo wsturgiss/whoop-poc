@@ -814,9 +814,11 @@ def start_live(minutes: float = LIVE_MINUTES) -> str:
     return msg
 
 
-# HR zones as % of max HR (the common 5-zone model). Max HR is personal: set WHOOP_MAX_HR.
+# HR zones by heart-rate reserve (Karvonen): low bound = rest + fraction × (max − rest). Both inputs are
+# fixed settings (WHOOP_MAX_HR, WHOOP_RESTING_HR) so zones don't shift between reloads or windows.
 MAX_HR = int(os.environ.get("WHOOP_MAX_HR", 190))
-ZONES = (  # (zone, name, low fraction of max HR, color), highest first
+REST_HR = int(os.environ.get("WHOOP_RESTING_HR", 60))
+ZONES = (  # (zone, name, low fraction of HR reserve, color), highest first
     ("Z5", "max", 0.90, "#ef4444"),
     ("Z4", "hard", 0.80, "#f97316"),
     ("Z3", "moderate", 0.70, "#eab308"),
@@ -828,17 +830,22 @@ BLOCKS = "▁▂▃▄▅▆▇█"
 LIVE_GAP_FILL_S = 5     # live graph: bridge reading gaps up to this long
 
 
-def hr_zone(bpm: float, max_hr: int = MAX_HR) -> tuple[str, str, float, str]:
-    return next((z for z in ZONES if bpm >= z[2] * max_hr), REST_ZONE)
+def zone_low(z: tuple, max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> int:
+    """Lowest whole bpm in a zone. hr_zone and zone_range both use this, so color and label always agree."""
+    return int(rest_hr + z[2] * (max_hr - rest_hr) + 0.5)
 
 
-def zone_range(z: tuple, max_hr: int = MAX_HR) -> str:
-    """bpm range label for a zone, e.g. '133–151'."""
-    order = (REST_ZONE,) + ZONES[::-1]
-    i = order.index(z)
-    lo = round(z[2] * max_hr)
-    return f"<{round(ZONES[-1][2] * max_hr)}" if z is REST_ZONE else (
-        f"{lo}+" if i == len(order) - 1 else f"{lo}–{round(order[i + 1][2] * max_hr) - 1}")
+def hr_zone(bpm: float, max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> tuple[str, str, float, str]:
+    return next((z for z in ZONES if bpm >= zone_low(z, max_hr, rest_hr)), REST_ZONE)
+
+
+def zone_range(z: tuple, max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> str:
+    """bpm range label for a zone, e.g. '136–147'."""
+    if z is REST_ZONE:
+        return f"<{zone_low(ZONES[-1], max_hr, rest_hr)}"
+    i = ZONES.index(z)
+    lo = zone_low(z, max_hr, rest_hr)
+    return f"{lo}+" if i == 0 else f"{lo}–{zone_low(ZONES[i - 1], max_hr, rest_hr) - 1}"
 
 
 def live_samples() -> list[tuple[int, int]]:
@@ -863,18 +870,18 @@ def last_live() -> dict | None:
         return None
 
 
-def zone_seconds(samples: list[tuple[int, int]], max_hr: int = MAX_HR) -> dict[str, int]:
+def zone_seconds(samples: list[tuple[int, int]], max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> dict[str, int]:
     """Seconds per zone; each sample counts until the next one (gaps over 5 s count as 1 s)."""
     out = {z[0]: 0 for z in (REST_ZONE,) + ZONES}
     for (t, b), nxt in zip(samples, samples[1:] + [None]):
         dt = 1 if nxt is None else nxt[0] - t
-        out[hr_zone(b, max_hr)[0]] += dt if 0 < dt <= 5 else 1
+        out[hr_zone(b, max_hr, rest_hr)[0]] += dt if 0 < dt <= 5 else 1
     return out
 
 
 def zone_chart(points: list[tuple[int, float]], width: int, height: int = 6, max_hr: int = MAX_HR,
                t0: int | None = None, t1: int | None = None, agg: str = "mean",
-               gap_fill_s: float = LIVE_GAP_FILL_S) -> list[str]:
+               gap_fill_s: float = LIVE_GAP_FILL_S, rest_hr: int = REST_HR) -> list[str]:
     """Rich-markup bar chart of (unix, bpm) points over [t0, t1]: one column per time slice (its mean or
     max bpm), each bar colored by HR zone, bpm labels on the left. Columns with no point reuse the last
     point if it is at most gap_fill_s old (bridges sampling gaps); longer holes stay empty. Returns
@@ -915,20 +922,21 @@ def zone_chart(points: list[tuple[int, float]], width: int, height: int = 6, max
                 continue
             e = round((v - lo) / (hi - lo) * height * 8) - floor
             ch = BLOCKS[7] if e >= 8 else BLOCKS[e - 1] if e > 0 else " "
-            cells.append(f"[{hr_zone(v, max_hr)[3]}]{ch}[/]" if ch != " " else " ")
+            cells.append(f"[{hr_zone(v, max_hr, rest_hr)[3]}]{ch}[/]" if ch != " " else " ")
         label = f"{hi:>3} " if r == 0 else f"{lo:>3} " if r == height - 1 else " " * lab
         lines.append(f"[dim]{label}[/]" + "".join(cells))
     return lines
 
 
 def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_hr: int = MAX_HR,
-               t1: int | None = None) -> list[str]:
+               t1: int | None = None, rest_hr: int = REST_HR) -> list[str]:
     """Live session chart: mean bpm per slice, short gaps bridged, start → end time axis underneath."""
     if not samples or width < 10:
         return []
     t0 = samples[0][0]
     t1 = max(t1 or samples[-1][0], t0 + 60)
-    lines = zone_chart(samples, width, height, max_hr, t0, t1, agg="mean", gap_fill_s=LIVE_GAP_FILL_S)
+    lines = zone_chart(samples, width, height, max_hr, t0, t1, agg="mean", gap_fill_s=LIVE_GAP_FILL_S,
+                       rest_hr=rest_hr)
     a, b = hhmm(t0), hhmm(t1)
     w = width - 4
     return lines + ["[dim]" + " " * 4 + a + " " * max(1, w - len(a) - len(b)) + b + "[/]"]

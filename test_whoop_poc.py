@@ -169,18 +169,33 @@ class Battery(unittest.TestCase):
 
 class Zones(unittest.TestCase):
     def test_zone_boundaries_and_labels(self):
-        self.assertEqual(w.hr_zone(94, 190)[0], "Z0")
-        self.assertEqual(w.hr_zone(95, 190)[0], "Z1")
-        self.assertEqual(w.hr_zone(152, 190)[0], "Z4")
-        self.assertEqual(w.hr_zone(171, 190)[0], "Z5")
-        labels = [w.zone_range(z, 190) for z in (w.REST_ZONE,) + w.ZONES[::-1]]
-        self.assertEqual(labels, ["<95", "95–113", "114–132", "133–151", "152–170", "171+"])
+        self.assertEqual(w.hr_zone(123, 185, 63)[0], "Z0")
+        self.assertEqual(w.hr_zone(124, 185, 63)[0], "Z1")
+        self.assertEqual(w.hr_zone(136, 185, 63)[0], "Z2")
+        self.assertEqual(w.hr_zone(147.6, 185, 63)[0], "Z2")
+        self.assertEqual(w.hr_zone(148, 185, 63)[0], "Z3")
+        self.assertEqual(w.hr_zone(173, 185, 63)[0], "Z5")
+        labels = [w.zone_range(z, 185, 63) for z in (w.REST_ZONE,) + w.ZONES[::-1]]
+        self.assertEqual(labels, ["<124", "124–135", "136–147", "148–160", "161–172", "173+"])
+
+    def test_color_and_label_agree_at_every_bpm(self):
+        for mx, rest in ((185, 63), (190, 60), (185, 0), (201, 47)):
+            for bpm in range(30, 220):
+                z = w.hr_zone(bpm, mx, rest)
+                r = w.zone_range(z, mx, rest)
+                if r.startswith("<"):
+                    self.assertLess(bpm, int(r[1:]))
+                elif r.endswith("+"):
+                    self.assertGreaterEqual(bpm, int(r[:-1]))
+                else:
+                    lo, hi = map(int, r.split("–"))
+                    self.assertTrue(lo <= bpm <= hi, (mx, rest, bpm, r))
 
     def test_zone_seconds_and_chart(self):
         s = [(1000 + i, 100 if i < 60 else 160) for i in range(120)]
-        secs = w.zone_seconds(s, 190)
+        secs = w.zone_seconds(s, 190, 0)
         self.assertEqual((secs["Z1"], secs["Z4"]), (60, 60))
-        lines = w.live_chart(s, 40, 4, 190)
+        lines = w.live_chart(s, 40, 4, 190, rest_hr=0)
         self.assertEqual(len(lines), 5)                    # 4 bar rows + time axis
         self.assertIn(w.ZONES[1][3], lines[0])             # top row only has the Z4 (hard) bars
         self.assertNotIn(w.ZONES[4][3], lines[0])
@@ -255,10 +270,10 @@ class HRChart(unittest.TestCase):
         # 3 h of minutes at rest with a 20-min Z4 burst, then 1 h strap-off, then rest again
         pts = [(t, 160 if 3600 <= t < 4800 else 65) for t in range(0, 3 * 3600, 60)]
         pts += [(t, 65) for t in range(4 * 3600, 5 * 3600, 60)]
-        rows = w.zone_chart(pts, 44, 4, 185, t0=0, t1=5 * 3600, agg="max", gap_fill_s=61)
+        rows = w.zone_chart(pts, 44, 4, 185, t0=0, t1=5 * 3600, agg="max", gap_fill_s=61, rest_hr=0)
         z4 = w.ZONES[1][3]
         self.assertIn(z4, "".join(rows))                       # the burst survives as Z4 at 40 cols
-        mean_rows = w.zone_chart(pts, 14, 4, 185, t0=0, t1=5 * 3600, agg="mean", gap_fill_s=61)
+        mean_rows = w.zone_chart(pts, 14, 4, 185, t0=0, t1=5 * 3600, agg="mean", gap_fill_s=61, rest_hr=0)
         self.assertNotIn(w.ZONES[0][3], "".join(mean_rows))    # sanity: never Z5 here
         import re
         bottom = re.sub(r"\[[^\]]*\]", "", rows[-1])[4:]

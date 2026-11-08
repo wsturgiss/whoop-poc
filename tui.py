@@ -192,7 +192,7 @@ class WhoopApp(App):
             return f"{v // 60}:{v % 60:02d}" if v < 3600 else f"{v // 3600}h{v % 3600 // 60:02d}m"
         return "   ".join(f"[{z[3]}]█[/] {z[0]} {core.zone_range(z)} [b]{t(secs[z[0]])}[/]"
                           for z in (core.REST_ZONE,) + core.ZONES[::-1]) + \
-            f"   [dim]max HR {core.MAX_HR} (WHOOP_MAX_HR)[/]"
+            f"   [dim]HR reserve: rest {core.REST_HR}, max {core.MAX_HR}[/]"
 
     def _render_live_graph(self, d: dict, chart: Static, key: Static, ended: bool) -> bool:
         """Draw the session graph + zone key; True if there was enough data to draw."""
