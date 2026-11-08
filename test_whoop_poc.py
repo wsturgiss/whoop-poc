@@ -248,3 +248,27 @@ class HourAxisEnds(unittest.TestCase):
             import re
             for m in re.finditer(r"\d\d:\d\d", labels):
                 self.assertEqual(ticks[m.start()] if m.start() < width - 5 else ticks[-1], "╵", (width, m.group()))
+
+
+class HRChart(unittest.TestCase):
+    def test_peak_keeps_short_workouts_and_gaps_stay(self):
+        # 3 h of minutes at rest with a 20-min Z4 burst, then 1 h strap-off, then rest again
+        pts = [(t, 160 if 3600 <= t < 4800 else 65) for t in range(0, 3 * 3600, 60)]
+        pts += [(t, 65) for t in range(4 * 3600, 5 * 3600, 60)]
+        rows = w.zone_chart(pts, 44, 4, 185, t0=0, t1=5 * 3600, agg="max", gap_fill_s=61)
+        z4 = w.ZONES[1][3]
+        self.assertIn(z4, "".join(rows))                       # the burst survives as Z4 at 40 cols
+        mean_rows = w.zone_chart(pts, 14, 4, 185, t0=0, t1=5 * 3600, agg="mean", gap_fill_s=61)
+        self.assertNotIn(w.ZONES[0][3], "".join(mean_rows))    # sanity: never Z5 here
+        import re
+        bottom = re.sub(r"\[[^\]]*\]", "", rows[-1])[4:]
+        self.assertIn(" ", bottom.strip())                      # the strap-off hour stays empty
+
+    def test_time_axis_names_midnights(self):
+        from datetime import datetime
+        t0 = int(datetime(2026, 11, 5, 9, 0).timestamp())
+        ticks, labels = w.time_axis(t0, t0 + 72 * 3600, 120)
+        for day in ("Fri", "Sat", "Sun"):
+            self.assertIn(day, labels)
+        for m in __import__("re").finditer(r"\S+", labels):
+            self.assertEqual(ticks[m.start()], "╵")

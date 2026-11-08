@@ -872,33 +872,37 @@ def zone_seconds(samples: list[tuple[int, int]], max_hr: int = MAX_HR) -> dict[s
     return out
 
 
-def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_hr: int = MAX_HR,
-               t1: int | None = None) -> list[str]:
-    """Rich-markup bar chart of a live session: one column per time bucket (mean bpm), bar colored by
-    HR zone, bpm labels on the left and a start → end time axis underneath."""
-    if not samples or width < 10:
+def zone_chart(points: list[tuple[int, float]], width: int, height: int = 6, max_hr: int = MAX_HR,
+               t0: int | None = None, t1: int | None = None, agg: str = "mean",
+               gap_fill_s: float = LIVE_GAP_FILL_S) -> list[str]:
+    """Rich-markup bar chart of (unix, bpm) points over [t0, t1]: one column per time slice (its mean or
+    max bpm), each bar colored by HR zone, bpm labels on the left. Columns with no point reuse the last
+    point if it is at most gap_fill_s old (bridges sampling gaps); longer holes stay empty. Returns
+    `height` rows; the time axis is up to the caller."""
+    if not points or width < 10:
         return []
     lab = 4
     w = width - lab
-    t0 = samples[0][0]
-    t1 = max(t1 or samples[-1][0], t0 + 60)
+    t0 = points[0][0] if t0 is None else t0
+    t1 = max(t1 or points[-1][0], t0 + 60)
     span = t1 - t0 + 1
-    cols: list[list[int]] = [[] for _ in range(w)]
-    for t, b in samples:
-        cols[min(w - 1, int((t - t0) * w / span))].append(b)
-    vals: list[float | None] = [sum(c) / len(c) if c else None for c in cols]
-    # The strap skips some seconds (1–3 s gaps are normal), and early in a session one column is less
-    # than a second wide. Carry the last reading forward across gaps up to LIVE_GAP_FILL_S so the graph is
-    # continuous; longer holes (link drops, reconnects) stay visibly empty.
+    cols: list[list[float]] = [[] for _ in range(w)]
+    for t, b in points:
+        if t0 <= t <= t1:
+            cols[min(w - 1, int((t - t0) * w / span))].append(b)
+    pick = max if agg == "max" else (lambda c: sum(c) / len(c))
+    vals: list[float | None] = [pick(c) if c else None for c in cols]
     i, last_t, last_v = 0, None, None
     for c in range(w):
         c_end = t0 + (c + 1) * span / w
-        while i < len(samples) and samples[i][0] < c_end:
-            last_t, last_v = samples[i]
+        while i < len(points) and points[i][0] < c_end:
+            last_t, last_v = points[i]
             i += 1
-        if vals[c] is None and last_t is not None and c_end - last_t <= LIVE_GAP_FILL_S + 1:
+        if vals[c] is None and last_t is not None and c_end - last_t <= gap_fill_s + 1:
             vals[c] = last_v
     have = [v for v in vals if v is not None]
+    if not have:
+        return []
     lo = int(min(have) - 5) // 10 * 10
     hi = -(-int(max(have) + 5) // 10) * 10
     lines = []
@@ -914,9 +918,45 @@ def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_
             cells.append(f"[{hr_zone(v, max_hr)[3]}]{ch}[/]" if ch != " " else " ")
         label = f"{hi:>3} " if r == 0 else f"{lo:>3} " if r == height - 1 else " " * lab
         lines.append(f"[dim]{label}[/]" + "".join(cells))
-    a, b = hhmm(t0), hhmm(t1)
-    lines.append("[dim]" + " " * lab + a + " " * max(1, w - len(a) - len(b)) + b + "[/]")
     return lines
+
+
+def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_hr: int = MAX_HR,
+               t1: int | None = None) -> list[str]:
+    """Live session chart: mean bpm per slice, short gaps bridged, start → end time axis underneath."""
+    if not samples or width < 10:
+        return []
+    t0 = samples[0][0]
+    t1 = max(t1 or samples[-1][0], t0 + 60)
+    lines = zone_chart(samples, width, height, max_hr, t0, t1, agg="mean", gap_fill_s=LIVE_GAP_FILL_S)
+    a, b = hhmm(t0), hhmm(t1)
+    w = width - 4
+    return lines + ["[dim]" + " " * 4 + a + " " * max(1, w - len(a) - len(b)) + b + "[/]"]
+
+
+def time_axis(t0: int, t1: int, width: int) -> tuple[str, str]:
+    """(tick row, label row) for a timeline over [t0, t1] in `width` columns. Picks the finest of
+    1/2/3/6/12/24 h whose labels fit; midnights are labelled with the day name (Sat) so multi-day
+    windows read at a glance, other ticks HH:MM."""
+    step = max(1e-9, (t1 - t0 + 1) / max(1, width))
+    for every in (1, 2, 3, 6, 12, 24):
+        first = (t0 // 3600 + 1) * 3600
+        picks = [t for t in range(first, t1 + 1, 3600) if datetime.fromtimestamp(t).hour % every == 0]
+        cols = [int((t - t0) / step) for t in picks]
+        if all(b - a >= 7 for a, b in zip(cols, cols[1:])):
+            break
+    ticks, labels = [" "] * width, [" "] * width
+    free = 0
+    for t, c in zip(picks, cols):
+        if not 0 <= c < width:
+            continue
+        ticks[c] = "╵"
+        d = datetime.fromtimestamp(t)
+        lab = d.strftime("%a") if d.hour == 0 else d.strftime("%H:%M")
+        if c >= free and c + len(lab) <= width:
+            labels[c:c + len(lab)] = lab
+            free = c + len(lab) + 1
+    return "".join(ticks), "".join(labels)
 
 
 def extend_live() -> bool:

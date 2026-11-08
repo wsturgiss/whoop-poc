@@ -7,7 +7,7 @@ from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import DataTable, Footer, Header, Sparkline, Static
+from textual.widgets import DataTable, Footer, Header, Static
 
 import whoop_poc as core
 
@@ -47,9 +47,8 @@ class WhoopApp(App):
     .h { text-style: bold; color: $warning; margin-top: 1; height: auto; }
     #tiles { height: 5; }
     Tile { border: round $panel-lighten-2; width: 1fr; height: 5; padding: 0 1; }
-    #hr-spark { height: 6; margin-top: 1; }
-    #hr-spark > .sparkline--max-color { color: $error; }
-    #hr-spark > .sparkline--min-color { color: $error 40%; }
+    #hr-chart { height: auto; margin-top: 1; }
+    #hr-key { height: auto; color: $text-muted; }
     #hr-axis, #sleep-note, #hypno-legend { color: $text-muted; height: auto; }
     #hypno { color: $accent; height: auto; margin-top: 1; }
     DataTable { height: auto; max-height: 8; }
@@ -88,8 +87,9 @@ class WhoopApp(App):
             with Horizontal(id="tiles"):
                 for i in ("now", "rest", "range", "worn", "batt"):
                     yield Tile(id=f"t-{i}")
-            yield Sparkline([], id="hr-spark", summary_function=max)
+            yield Static(id="hr-chart")
             yield Static(id="hr-axis")
+            yield Static(id="hr-key")
             yield Static("SLEEP", id="sleep-head", classes="h")
             yield Static(id="sleep-note")
             yield DataTable(id="sleep-table", cursor_type="row", zebra_stripes=True)
@@ -185,6 +185,15 @@ class WhoopApp(App):
             head.update(f"[red]♡[/] [b]LIVE HR[/]  {msg}    {tail}")
         self._render_live_graph(d, chart, key, ended=False)
 
+    @staticmethod
+    def zone_key(secs: dict[str, int]) -> str:
+        """Color key: each zone's swatch, bpm range and time in it (m:ss under an hour, else XhYYm)."""
+        def t(v):
+            return f"{v // 60}:{v % 60:02d}" if v < 3600 else f"{v // 3600}h{v % 3600 // 60:02d}m"
+        return "   ".join(f"[{z[3]}]█[/] {z[0]} {core.zone_range(z)} [b]{t(secs[z[0]])}[/]"
+                          for z in (core.REST_ZONE,) + core.ZONES[::-1]) + \
+            f"   [dim]max HR {core.MAX_HR} (WHOOP_MAX_HR)[/]"
+
     def _render_live_graph(self, d: dict, chart: Static, key: Static, ended: bool) -> bool:
         """Draw the session graph + zone key; True if there was enough data to draw."""
         if self._live_drawn and time.time() - self._live_drawn_at < 1.0:   # ~1/s; the heart animates faster
@@ -197,10 +206,7 @@ class WhoopApp(App):
             return False
         width = max(20, self.size.width - 8)
         chart.update("\n".join(core.live_chart(s, width, 6, t1=None if ended else int(time.time()))))
-        secs = core.zone_seconds(s)
-        key.update("   ".join(
-            f"[{z[3]}]█[/] {z[0]} {core.zone_range(z)} [b]{secs[z[0]] // 60}:{secs[z[0]] % 60:02d}[/]"
-            for z in (core.REST_ZONE,) + core.ZONES[::-1]) + f"   [dim]max HR {core.MAX_HR} (WHOOP_MAX_HR)[/]")
+        key.update(self.zone_key(core.zone_seconds(s)))
         self._live_drawn = True
         return True
 
@@ -321,19 +327,29 @@ class WhoopApp(App):
 
         now, stats, hm = r.hr_now, r.hr_stats(), r.hr_minutes
         t = {k: self.query_one(f"#t-{k}", Tile) for k in ("now", "rest", "range", "worn")}
-        spark, axis = self.query_one("#hr-spark", Sparkline), self.query_one("#hr-axis", Static)
+        chart, axis, key = (self.query_one(f"#hr-{i}", Static) for i in ("chart", "axis", "key"))
         if now and stats:
             t["now"].show("♥ LATEST", f"[red]{now.hr}[/] bpm", f"{core.hhmm(now.unix)} · {core.ago(now.unix)}")
             t["rest"].show("RESTING ≈", f"{stats['rest']:.0f} bpm", "5th pct, still minutes")
             t["range"].show("RANGE", f"{stats['min']:.0f}–{stats['max']:.0f} bpm", f"avg {stats['avg']:.0f}")
             t["worn"].show("WORN", core.dur(stats["worn_min"]), f"last {(r.until - r.since) // 3600}h")
-            spark.data = [m.hr for m in hm]
-            axis.update(f"per-minute HR  {core.hhmm(hm[0].t)} → {core.hhmm(hm[-1].t + 60)}   "
-                        f"({min(m.hr for m in hm):.0f}–{max(m.hr for m in hm):.0f} bpm)")
+            # Time-true: each minute sits at its real time (gaps = strap off), columns show the peak of
+            # their slice (a 30-min run must not average away at 7d), bars colored by HR zone.
+            width = max(20, self.size.width - 6)
+            rows = core.zone_chart([(m.t, m.hr) for m in hm], width, 6, t0=r.since, t1=r.until,
+                                   agg="max", gap_fill_s=61)
+            ticks, labels = core.time_axis(r.since, r.until, width - 4)
+            chart.update("\n".join(rows + [f"[dim]    {ticks}\n    {labels}[/]"]))
+            axis.update(f"per-minute HR, peak per column  ({min(m.hr for m in hm):.0f}–{max(m.hr for m in hm):.0f} bpm)")
+            secs = {z[0]: 0 for z in (core.REST_ZONE,) + core.ZONES}
+            for m in hm:
+                secs[core.hr_zone(m.hr)[0]] += 60
+            key.update(self.zone_key(secs))
         else:
             for k in t:
                 t[k].show(k.upper(), "—", "")
-            spark.data = []
+            chart.update("")
+            key.update("")
             d = self._drain
             axis.update(f"nothing in this window yet: the drain has reached {d['at'][:-3]} and fills in "
                         f"oldest → newest. Press w for a longer window." if d and d.get("at") else
