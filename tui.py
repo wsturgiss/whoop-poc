@@ -232,8 +232,9 @@ class WhoopApp(App):
     def on_resize(self, _event) -> None:
         # Width-dependent pieces (sleep timeline, hour axis) were sized for the old width: redraw now
         # instead of wrapping until the next auto-reload.
+        # self.size still holds the old width while this handler runs: redraw after the refresh.
         if getattr(self, "_report", None) is not None:
-            self.render_report(self._report)
+            self.call_after_refresh(self.render_report, self._report)
         self._live_drawn = False
 
     def action_sync(self) -> None:
