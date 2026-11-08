@@ -185,3 +185,18 @@ class Zones(unittest.TestCase):
         self.assertIn(w.ZONES[1][3], lines[0])             # top row only has the Z4 (hard) bars
         self.assertNotIn(w.ZONES[4][3], lines[0])
         self.assertEqual(w.live_chart([], 40), [])
+
+
+class LiveGaps(unittest.TestCase):
+    def _bar_cols(self, lines):
+        import re
+        bottom = re.sub(r"\[[^\]]*\]", "", lines[-2])[4:]     # strip markup + y label
+        return [ch != " " for ch in bottom]
+
+    def test_short_gaps_filled_long_gaps_kept(self):
+        s = [(1000 + t, 70) for t in range(0, 120) if t % 3 != 2]          # every 3rd second missing
+        cols = self._bar_cols(w.live_chart(s, 204, 4, 185))                 # 200 columns > 120 s
+        self.assertTrue(all(cols[:195]), "short gaps should be bridged")
+        s2 = [(1000 + t, 70) for t in list(range(0, 40)) + list(range(80, 120))]   # 40 s dropout
+        cols2 = self._bar_cols(w.live_chart(s2, 124, 4, 185))
+        self.assertFalse(all(cols2), "a long dropout must stay visible")

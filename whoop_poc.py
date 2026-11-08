@@ -743,6 +743,7 @@ ZONES = (  # (zone, name, low fraction of max HR, color), highest first
 )
 REST_ZONE = ("Z0", "rest", 0.0, "#6b7280")
 BLOCKS = "▁▂▃▄▅▆▇█"
+LIVE_GAP_FILL_S = 5     # live graph: bridge reading gaps up to this long
 
 
 def hr_zone(bpm: float, max_hr: int = MAX_HR) -> tuple[str, str, float, str]:
@@ -799,10 +800,22 @@ def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_
     w = width - lab
     t0 = samples[0][0]
     t1 = max(t1 or samples[-1][0], t0 + 60)
+    span = t1 - t0 + 1
     cols: list[list[int]] = [[] for _ in range(w)]
     for t, b in samples:
-        cols[min(w - 1, int((t - t0) * w / (t1 - t0 + 1)))].append(b)
-    vals = [sum(c) / len(c) if c else None for c in cols]
+        cols[min(w - 1, int((t - t0) * w / span))].append(b)
+    vals: list[float | None] = [sum(c) / len(c) if c else None for c in cols]
+    # The strap skips some seconds (1–3 s gaps are normal), and early in a session one column is less
+    # than a second wide. Carry the last reading forward across gaps up to LIVE_GAP_FILL_S so the graph is
+    # continuous; longer holes (link drops, reconnects) stay visibly empty.
+    i, last_t, last_v = 0, None, None
+    for c in range(w):
+        c_end = t0 + (c + 1) * span / w
+        while i < len(samples) and samples[i][0] < c_end:
+            last_t, last_v = samples[i]
+            i += 1
+        if vals[c] is None and last_t is not None and c_end - last_t <= LIVE_GAP_FILL_S + 1:
+            vals[c] = last_v
     have = [v for v in vals if v is not None]
     lo = int(min(have) - 5) // 10 * 10
     hi = -(-int(max(have) + 5) // 10) * 10
