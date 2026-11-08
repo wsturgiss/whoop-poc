@@ -213,3 +213,19 @@ class WindowLabel(unittest.TestCase):
         self.assertTrue(w.window_label(start, end, ts(2026, 11, 10, 9, 0)).endswith("ended 3 days ago"))
         nap = w.window_label(ts(2026, 11, 7, 13, 0), ts(2026, 11, 7, 14, 30), ts(2026, 11, 7, 18, 0))
         self.assertEqual(nap, "Sat Nov 07 13:00 → 14:30 · ended today")
+
+
+class HourAxis(unittest.TestCase):
+    def test_ticks_align_and_thin_out(self):
+        from datetime import datetime
+        ts = lambda *a: int(datetime(*a).timestamp())
+        start, end = ts(2026, 11, 7, 23, 28), ts(2026, 11, 8, 7, 5)       # 7h37m
+        ticks, labels = w.hour_axis(start, end, 120)
+        self.assertEqual((len(ticks), len(labels)), (120, 120))
+        self.assertEqual(ticks.count("╵"), 8)                               # 00:00 … 07:00
+        self.assertTrue(labels.rstrip().endswith("07:00"))                  # edge label right-aligned
+        c = ticks.index("╵")
+        self.assertEqual(labels[c:c + 5], "00:00")
+        self.assertEqual(c, int((ts(2026, 11, 8, 0, 0) - start) / ((end - start) / 120)))
+        narrow, _ = w.hour_axis(start, end, 30)                             # 8 labels won't fit in 30
+        self.assertLess(narrow.count("╵"), 8)

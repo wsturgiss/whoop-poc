@@ -226,8 +226,15 @@ class WhoopApp(App):
         w.display = True
 
     def action_reload(self) -> None:
-        r = core.build_report(self.args.db, self.args.hours, self.args.address, demo=self.args.demo)
-        self.render_report(r)
+        self._report = core.build_report(self.args.db, self.args.hours, self.args.address, demo=self.args.demo)
+        self.render_report(self._report)
+
+    def on_resize(self, _event) -> None:
+        # Width-dependent pieces (sleep timeline, hour axis) were sized for the old width: redraw now
+        # instead of wrapping until the next auto-reload.
+        if getattr(self, "_report", None) is not None:
+            self.render_report(self._report)
+        self._live_drawn = False
 
     def action_sync(self) -> None:
         # Never own the drain: it can run 20 min, and q must quit immediately. The banner tracks it.
@@ -313,7 +320,8 @@ class WhoopApp(App):
             bar = "".join(" " if not b else "█" if sum(m.asleep for m in b) * 2 >= len(b) else "[dim]░[/]"
                           for b in bins)
             legend_txt = "█ still + calm HR (≈asleep)   ░ restless / awake"
-        hyp.update(f"latest window  {core.window_label(last.start, last.end)}\n{bar}")
+        ticks, labels = core.hour_axis(last.start, last.end, width)
+        hyp.update(f"latest window  {core.window_label(last.start, last.end)}\n{bar}\n[dim]{ticks}\n{labels}[/]")
         legend.update(legend_txt)
 
 

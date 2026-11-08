@@ -360,6 +360,31 @@ def stage_bar(s: "SleepWindow", width: int, markup: bool = False) -> str:
     return "".join(out)
 
 
+def hour_axis(start: int, end: int, width: int) -> tuple[str, str]:
+    """(tick row, label row) aligned to a `width`-column timeline spanning start→end: a tick under the
+    column where each whole hour falls, labelled HH:00. Uses every 2nd/3rd/… hour if labels would collide."""
+    step = max(1e-9, (end - start) / max(1, width))
+    first = (start // 3600 + 1) * 3600
+    hours = list(range(first, end + 1, 3600))
+    for every in (1, 2, 3, 4, 6, 12):
+        picks = [t for t in hours if datetime.fromtimestamp(t).hour % every == 0] if every > 1 else hours
+        cols = [int((t - start) / step) for t in picks]
+        if all(b - a >= 6 for a, b in zip(cols, cols[1:])):
+            break
+    ticks, labels = [" "] * width, [" "] * width
+    free = 0                                     # first label column not yet used (keeps a 1-col gap)
+    for t, c in zip(picks, cols):
+        if not 0 <= c < width:
+            continue
+        ticks[c] = "╵"
+        lab = datetime.fromtimestamp(t).strftime("%H:%M")
+        at = min(c, width - len(lab))            # a label at the right edge ends at the edge
+        if at >= free:
+            labels[at:at + len(lab)] = lab
+            free = at + len(lab) + 1
+    return "".join(ticks), "".join(labels)
+
+
 def hhmm(t: int) -> str:
     return datetime.fromtimestamp(t).strftime("%H:%M")
 
