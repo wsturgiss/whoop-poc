@@ -17,6 +17,7 @@ full realtime arm (adds SEND_R10_R11_REALTIME: R-R + raw IMU, more radio traffic
 Output: $XDG_STATE_HOME/whoop-poc/live.json, rewritten atomically on each beat/state change:
   {"schema":1, "state":"connecting|waiting|live|reconnecting|ended", "bpm":N|null, "unix":T|null,
    "started_unix":T, "until_unix":T, "pid":P, "mode":"hr|full"|null, "note":str|null}
+Each reading is also appended to live-samples.csv ("unix,bpm", one per second) for the session graph.
 Run with NOOP linux-capture's venv python from its directory (the wrapper does this).
 """
 import argparse
@@ -55,7 +56,17 @@ class Out:
         self.doc = {"schema": 1, "state": "connecting", "bpm": None, "unix": None, "started_unix": now,
                     "until_unix": now + int(minutes * 60), "pid": os.getpid(), "mode": None, "note": None}
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        # Session series for the TUI graph: "unix,bpm" per second, truncated at each session start.
+        sp = os.path.join(os.path.dirname(self.path), "live-samples.csv")
+        self._samples = os.fdopen(os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w")
+        self._last_t = None
         self.write()
+
+    def sample(self, t: int, bpm: int):
+        if t != self._last_t:            # REALTIME_DATA can arrive more than once a second
+            self._last_t = t
+            self._samples.write(f"{t},{bpm}\n")
+            self._samples.flush()
 
     def write(self, **kw):
         self.doc.update(kw)
@@ -72,6 +83,7 @@ async def session(client, fam, out, stop):
     def beat(bpm):
         last_hr["t"] = time.time()
         out.write(state="live", bpm=bpm, unix=int(last_hr["t"]))
+        out.sample(int(last_hr["t"]), bpm)
 
     def on_std(_c, data):
         if bpm := wf.parse_standard_hr(bytes(data)):

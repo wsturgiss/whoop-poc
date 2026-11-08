@@ -165,3 +165,23 @@ class Battery(unittest.TestCase):
             self.assertEqual(w.last_battery()["pct"], 67)
             (Path(d) / "battery.json").write_text('{"pct":"oops"}')
             self.assertIsNone(w.last_battery())
+
+
+class Zones(unittest.TestCase):
+    def test_zone_boundaries_and_labels(self):
+        self.assertEqual(w.hr_zone(94, 190)[0], "Z0")
+        self.assertEqual(w.hr_zone(95, 190)[0], "Z1")
+        self.assertEqual(w.hr_zone(152, 190)[0], "Z4")
+        self.assertEqual(w.hr_zone(171, 190)[0], "Z5")
+        labels = [w.zone_range(z, 190) for z in (w.REST_ZONE,) + w.ZONES[::-1]]
+        self.assertEqual(labels, ["<95", "95–113", "114–132", "133–151", "152–170", "171+"])
+
+    def test_zone_seconds_and_chart(self):
+        s = [(1000 + i, 100 if i < 60 else 160) for i in range(120)]
+        secs = w.zone_seconds(s, 190)
+        self.assertEqual((secs["Z1"], secs["Z4"]), (60, 60))
+        lines = w.live_chart(s, 40, 4, 190)
+        self.assertEqual(len(lines), 5)                    # 4 bar rows + time axis
+        self.assertIn(w.ZONES[1][3], lines[0])             # top row only has the Z4 (hard) bars
+        self.assertNotIn(w.ZONES[4][3], lines[0])
+        self.assertEqual(w.live_chart([], 40), [])

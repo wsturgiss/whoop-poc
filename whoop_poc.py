@@ -716,6 +716,98 @@ def start_live(minutes: float = LIVE_MINUTES) -> str:
     return msg
 
 
+# HR zones as % of max HR (the common 5-zone model). Max HR is personal: set WHOOP_MAX_HR.
+MAX_HR = int(os.environ.get("WHOOP_MAX_HR", 190))
+ZONES = (  # (zone, name, low fraction of max HR, color), highest first
+    ("Z5", "max", 0.90, "#ef4444"),
+    ("Z4", "hard", 0.80, "#f97316"),
+    ("Z3", "moderate", 0.70, "#eab308"),
+    ("Z2", "light", 0.60, "#22c55e"),
+    ("Z1", "very light", 0.50, "#38bdf8"),
+)
+REST_ZONE = ("Z0", "rest", 0.0, "#6b7280")
+BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def hr_zone(bpm: float, max_hr: int = MAX_HR) -> tuple[str, str, float, str]:
+    return next((z for z in ZONES if bpm >= z[2] * max_hr), REST_ZONE)
+
+
+def zone_range(z: tuple, max_hr: int = MAX_HR) -> str:
+    """bpm range label for a zone, e.g. '133–151'."""
+    order = (REST_ZONE,) + ZONES[::-1]
+    i = order.index(z)
+    lo = round(z[2] * max_hr)
+    return f"<{round(ZONES[-1][2] * max_hr)}" if z is REST_ZONE else (
+        f"{lo}+" if i == len(order) - 1 else f"{lo}–{round(order[i + 1][2] * max_hr) - 1}")
+
+
+def live_samples() -> list[tuple[int, int]]:
+    """The current/last live session's (unix, bpm) series, from live-samples.csv."""
+    out = []
+    try:
+        for ln in (STATE_DIR / "live-samples.csv").read_text().splitlines():
+            t, _, b = ln.partition(",")
+            if t.isdigit() and b.isdigit():
+                out.append((int(t), int(b)))
+    except OSError:
+        pass
+    return out
+
+
+def last_live() -> dict | None:
+    """live.json whatever its state (running or ended)."""
+    import json
+    try:
+        return json.loads((STATE_DIR / "live.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def zone_seconds(samples: list[tuple[int, int]], max_hr: int = MAX_HR) -> dict[str, int]:
+    """Seconds per zone; each sample counts until the next one (gaps over 5 s count as 1 s)."""
+    out = {z[0]: 0 for z in (REST_ZONE,) + ZONES}
+    for (t, b), nxt in zip(samples, samples[1:] + [None]):
+        dt = 1 if nxt is None else nxt[0] - t
+        out[hr_zone(b, max_hr)[0]] += dt if 0 < dt <= 5 else 1
+    return out
+
+
+def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_hr: int = MAX_HR,
+               t1: int | None = None) -> list[str]:
+    """Rich-markup bar chart of a live session: one column per time bucket (mean bpm), bar colored by
+    HR zone, bpm labels on the left and a start → end time axis underneath."""
+    if not samples or width < 10:
+        return []
+    lab = 4
+    w = width - lab
+    t0 = samples[0][0]
+    t1 = max(t1 or samples[-1][0], t0 + 60)
+    cols: list[list[int]] = [[] for _ in range(w)]
+    for t, b in samples:
+        cols[min(w - 1, int((t - t0) * w / (t1 - t0 + 1)))].append(b)
+    vals = [sum(c) / len(c) if c else None for c in cols]
+    have = [v for v in vals if v is not None]
+    lo = int(min(have) - 5) // 10 * 10
+    hi = -(-int(max(have) + 5) // 10) * 10
+    lines = []
+    for r in range(height):
+        floor = (height - 1 - r) * 8
+        cells = []
+        for v in vals:
+            if v is None:
+                cells.append(" ")
+                continue
+            e = round((v - lo) / (hi - lo) * height * 8) - floor
+            ch = BLOCKS[7] if e >= 8 else BLOCKS[e - 1] if e > 0 else " "
+            cells.append(f"[{hr_zone(v, max_hr)[3]}]{ch}[/]" if ch != " " else " ")
+        label = f"{hi:>3} " if r == 0 else f"{lo:>3} " if r == height - 1 else " " * lab
+        lines.append(f"[dim]{label}[/]" + "".join(cells))
+    a, b = hhmm(t0), hhmm(t1)
+    lines.append("[dim]" + " " * lab + a + " " * max(1, w - len(a) - len(b)) + b + "[/]")
+    return lines
+
+
 def extend_live() -> bool:
     """+10 min on a running live session (whoop_live.py handles SIGUSR1; capped at 3 h total)."""
     import signal

@@ -41,6 +41,8 @@ class WhoopApp(App):
     Screen { padding: 0 1; }
     #meta { color: $text-muted; height: auto; margin-bottom: 1; }
     #live { height: auto; border: round $error; padding: 0 1; display: none; }
+    #live-head, #live-chart, #live-key { height: auto; }
+    #live-key { color: $text-muted; }
     #drain { height: auto; color: $accent; border: round $accent; padding: 0 1; display: none; }
     .h { text-style: bold; color: $warning; margin-top: 1; height: auto; }
     #tiles { height: 5; }
@@ -67,12 +69,16 @@ class WhoopApp(App):
         self._live_pending = 0.0        # until when a just-requested live session counts as starting
         self._live_ours = False         # this TUI started it → stop it on quit (strap battery)
         self._live_stopping = None      # pid we asked to stop (it takes a few s to switch the stream off)
+        self._live_drawn, self._live_drawn_at = False, 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with VerticalScroll():
             yield Static(id="meta")
-            yield Static(id="live")
+            with Vertical(id="live"):
+                yield Static(id="live-head")
+                yield Static(id="live-chart")
+                yield Static(id="live-key")
             yield Static(id="drain")
             yield Static("HEART RATE", classes="h")
             with Horizontal(id="tiles"):
@@ -131,17 +137,30 @@ class WhoopApp(App):
         self.exit()
 
     def render_live(self) -> None:
-        d, w = self._live, self.query_one("#live", Static)
+        d, box = self._live, self.query_one("#live", Vertical)
+        head, chart, key = (self.query_one(f"#live-{i}", Static) for i in ("head", "chart", "key"))
         pending = time.time() < self._live_pending
         if not d and not pending:
-            w.display = False
+            last = None if self.args.demo else core.last_live()
+            # After a session ends, keep its graph up for review (until the next one, or 12 h).
+            if last and last.get("state") == "ended" and time.time() - (last.get("unix") or 0) < 12 * 3600:
+                if self._render_live_graph(last, chart, key, ended=True):
+                    s = core.live_samples()
+                    bpms = [b for _, b in s]
+                    head.update(f"[b]LAST LIVE SESSION[/]  {core.hhmm(s[0][0])} → {core.hhmm(s[-1][0])} · "
+                                f"{core.dur((s[-1][0] - s[0][0]) // 60)} · avg [b]{sum(bpms) / len(bpms):.0f}[/] · "
+                                f"max [b]{max(bpms)}[/] bpm    [dim]l starts a new one[/]")
+                    box.display = True
+                    return
+            box.display = False
             return
-        w.display = True
+        box.display = True
         if not d:
-            w.update("[b red]♥ LIVE HR[/]  [dim]starting… (waiting for the strap; a running sync saves first)[/]")
+            head.update("[b red]♥ LIVE HR[/]  [dim]starting… (waiting for the strap; a running sync saves first)[/]")
+            chart.update(""); key.update("")
             return
         if d.get("pid") == self._live_stopping:
-            w.update("[red]♡[/] [b]LIVE HR[/]  [dim]stopping (switching the stream off)…[/]")
+            head.update("[red]♡[/] [b]LIVE HR[/]  [dim]stopping (switching the stream off)…[/]")
             return
         left = max(0, d["until_unix"] - int(time.time()))
         tail = f"[dim]auto-off in {left // 60}:{left % 60:02d} · + adds 10 min · l stops[/]"
@@ -151,11 +170,32 @@ class WhoopApp(App):
             heart = "[b red]♥[/]" if beat else "[red]♡[/]"
             stale = int(time.time()) - (d.get("unix") or 0)
             age = f"  [dim]({stale}s old)[/]" if stale > 5 else ""
-            w.update(f"{heart} [b]LIVE[/]  [b red]{d['bpm']}[/] bpm{age}    {tail}")
+            z = core.hr_zone(d["bpm"])
+            head.update(f"{heart} [b]LIVE[/]  [b red]{d['bpm']}[/] bpm  [b {z[3]}]{z[0]} {z[1]}[/]{age}    {tail}")
         else:
             msg = {"connecting": "connecting to strap…", "waiting": "connected, waiting for heart rate (on your wrist?)",
                    "reconnecting": "link dropped, reconnecting…"}.get(d["state"], d["state"])
-            w.update(f"[red]♡[/] [b]LIVE HR[/]  {msg}    {tail}")
+            head.update(f"[red]♡[/] [b]LIVE HR[/]  {msg}    {tail}")
+        self._render_live_graph(d, chart, key, ended=False)
+
+    def _render_live_graph(self, d: dict, chart: Static, key: Static, ended: bool) -> bool:
+        """Draw the session graph + zone key; True if there was enough data to draw."""
+        if self._live_drawn and time.time() - self._live_drawn_at < 1.0:   # ~1/s; the heart animates faster
+            return True
+        s = core.live_samples()
+        self._live_drawn_at = time.time()
+        if len(s) < 2:
+            chart.update(""); key.update("")
+            self._live_drawn = False
+            return False
+        width = max(20, self.size.width - 8)
+        chart.update("\n".join(core.live_chart(s, width, 6, t1=None if ended else int(time.time()))))
+        secs = core.zone_seconds(s)
+        key.update("   ".join(
+            f"[{z[3]}]█[/] {z[0]} {core.zone_range(z)} [b]{secs[z[0]] // 60}:{secs[z[0]] % 60:02d}[/]"
+            for z in (core.REST_ZONE,) + core.ZONES[::-1]) + f"   [dim]max HR {core.MAX_HR} (WHOOP_MAX_HR)[/]")
+        self._live_drawn = True
+        return True
 
     def animate_drain(self) -> None:
         if self._frame % 3 == 0:
