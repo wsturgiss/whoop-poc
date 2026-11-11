@@ -10,7 +10,7 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
 - **summary** is a plain-text printout.
 - **coach** prints a compact summary for an LLM assistant (per-day rows, detected workouts, gaps,
   freshness, trends; ~2–3.5 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
-  `coach workout <start>`. **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
+  `coach workout <id>` (computed detail: peaks, recovery, drift, intervals). **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
   with per-minute HR; `json --raw` and **serve** also give the per-minute snapshot. The contract is in [COACH.md](COACH.md).
 
 ## Install (per user, no root)

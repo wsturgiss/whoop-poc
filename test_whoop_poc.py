@@ -380,8 +380,9 @@ class Coach(unittest.TestCase):
         now = self.ts(2026, 11, 11, 20, 0)
         win, _ = self.week(now)
         doc = coach.workout_view(win, self.ts(2026, 11, 11, 18, 10))
-        self.assertEqual(doc["schema"], "whoop-poc/workout@1")
-        self.assertEqual(len(doc["hr_per_minute"]), 40)
+        self.assertEqual(doc["schema"], "whoop-poc/workout@2")
+        self.assertNotIn("hr_per_minute", doc)
+        self.assertEqual(len(coach.workout_view(win, self.ts(2026, 11, 11, 18, 10), series="1m")["hr_per_minute"]), 40)
         self.assertIsNone(coach.workout_view(win, self.ts(2026, 11, 11, 13, 0)))
 
     def test_archive_writes_final_once_and_prunes(self):

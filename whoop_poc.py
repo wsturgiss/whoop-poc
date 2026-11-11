@@ -1119,10 +1119,12 @@ def start_sync_background() -> tuple[bool, str]:
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="whoop-poc", description=__doc__.splitlines()[0])
     p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "coach", "json", "serve"])
-    p.add_argument("rest", nargs="*", help="coach: since <unix> | day <YYYY-MM-DD> | workout <start> | confirm <start>")
+    p.add_argument("rest", nargs="*", help="coach: since <unix> | day <YYYY-MM-DD> | workout <id> | confirm <id>")
     p.add_argument("--minutes", type=int, help="coach confirm: the wearer's duration for the workout, minutes")
     p.add_argument("--start", help="coach confirm: the wearer's start time, HH:MM on the workout's day (optional)")
     p.add_argument("--clear", action="store_true", help="coach confirm: remove the workout's confirmation")
+    p.add_argument("--kind", help="coach workout: run (default fields) or lift (set detection instead of cardio fields)")
+    p.add_argument("--series", help="coach workout: also return HR as 1m (per minute) or 10s means")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"NOOP whoop.db (default {DEFAULT_DB}; env WHOOP_DB)")
     p.add_argument("--address", help="strap MAC if the DB holds several devices")
     p.add_argument("--hours", type=float, default=24, help="look-back window (default 24; json --raw, summary, html, tui)")

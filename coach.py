@@ -7,8 +7,8 @@ arrays. Per-minute HR and sleep stage segments live in whoop.db and in the daily
   whoop-poc coach                      summary of the last WHOOP_COACH_DAYS days (whoop-poc/snapshot@3)
   whoop-poc coach since <unix>         the same, keeping only records that end after <unix>
   whoop-poc coach day YYYY-MM-DD       one day: summary row, sleep, workouts, gaps, hourly HR
-  whoop-poc coach workout <start>      one workout with HR at 1-min resolution
-  whoop-poc coach confirm <start> --minutes N [--start HH:MM]
+  whoop-poc coach workout <id>         one workout's computed detail (peaks, recovery, drift, intervals, …)
+  whoop-poc coach confirm <id> --minutes N [--start HH:MM]
                                        record the wearer's confirmed duration (--clear removes it)
 """
 from __future__ import annotations
@@ -23,11 +23,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import whoop_poc as w     # importing it loads ~/.config/whoop-poc/env into os.environ
+import workout_detail as wd
 
 SUMMARY_SCHEMA = "whoop-poc/snapshot@3"
 DAY_SCHEMA = "whoop-poc/day@2"
 DAY_VIEW_SCHEMA = "whoop-poc/day-view@2"
-WORKOUT_SCHEMA = "whoop-poc/workout@1"
+WORKOUT_SCHEMA = "whoop-poc/workout@2"
 CONFIRM_SCHEMA = "whoop-poc/workout-confirm@1"
 CONFIRM_FILE = "workout-confirm.json"     # in w.STATE_DIR, next to coach.json; never in whoop.db
 
@@ -63,6 +64,11 @@ def local_date(t: int) -> date:
 
 def hm(t: int) -> str:
     return datetime.fromtimestamp(t, TZ).strftime("%H:%M")
+
+
+def workout_id(t: int) -> str:
+    """'2026-11-11-0824': a workout's readable ID, its detected start in local time."""
+    return datetime.fromtimestamp(t, TZ).strftime("%Y-%m-%d-%H%M")
 
 
 def span_local(a: int, b: int) -> str:
@@ -103,7 +109,7 @@ def detect_workouts(mins: list[w.Minute]) -> list[dict]:
             continue
         inside = [m for m in mins if a <= m.t < b]
         hrs = [m.hr for m in inside]
-        out.append({"start_unix": a, "end_unix": b, "local": datetime.fromtimestamp(a, TZ).strftime("%m-%d ") + span_local(a, b),
+        out.append({"id": workout_id(a), "start_unix": a, "end_unix": b, "local": datetime.fromtimestamp(a, TZ).strftime("%m-%d ") + span_local(a, b),
                     "duration_min": (b - a) // 60, "avg_hr": round(st.mean(hrs)), "max_hr": round(max(hrs)),
                     "zone_min": zone_min(inside)})
     return out
@@ -286,7 +292,7 @@ class Window:
 # The summary's workout table. Objects (day files, day view, workout view) also carry `confirmed` and
 # `confirmed_start_unix`; in the table a confirmed row is one with needs_confirm false.
 WORKOUT_COLS = ["start_unix", "end_unix", "local", "duration_min", "avg_hr", "max_hr", "zone_min",
-                "detected_min", "needs_confirm"]
+                "detected_min", "needs_confirm", "id"]
 
 
 def table(records: list[dict], cols: list[str]) -> dict:
@@ -342,6 +348,10 @@ def freshness(win: Window) -> dict:
     return out
 
 
+def zones() -> dict:
+    return {"max_hr": w.MAX_HR, "rest_hr": w.REST_HR, **{z[0]: w.zone_low(z) for z in w.ZONES[::-1]}}
+
+
 def summary(win: Window, days: list[date], since: int | None = None) -> dict:
     """whoop-poc/snapshot@3. With `since`, only records ending after it (days still open count), plus
     workouts confirmed after it."""
@@ -366,7 +376,7 @@ def summary(win: Window, days: list[date], since: int | None = None) -> dict:
         "cursor_unix": win.newest,           # newest sample; pass it to `coach since` next time
         "freshness": freshness(win),
         "latest_hr": None if latest is None else {"unix": latest.unix, "bpm": latest.hr},
-        "zones": {"max_hr": w.MAX_HR, "rest_hr": w.REST_HR, **{z[0]: w.zone_low(z) for z in w.ZONES[::-1]}},
+        "zones": zones(),
         "sleep_source": win.r.meta.get("sleep_source"),
         "days": rows, "workouts": table(workouts, WORKOUT_COLS), "gaps": gaps, "trends": trend,
     }
@@ -409,18 +419,50 @@ def day_view(win: Window, d: date) -> dict:
     }
 
 
-def workout_view(win: Window, t: int) -> dict | None:
-    """whoop-poc/workout@1: the workout containing (or starting nearest, within 15 min) time t."""
+def find_workout(win: Window, t: int) -> dict | None:
+    """The workout containing time t, or else the one starting or ending nearest to it, within 15 min."""
     def dist(x):
         return 0 if x["start_unix"] <= t < x["end_unix"] else min(abs(x["start_unix"] - t), abs(x["end_unix"] - t))
     near = [x for x in win.workouts if dist(x) <= 15 * 60]
-    if not near:
+    return min(near, key=dist) if near else None
+
+
+WORKOUT_KINDS = ("run", "lift")
+SERIES = ("1m", "10s")
+
+
+def workout_view(win: Window, t: int, kind: str | None = None, series: str | None = None,
+                 db: Path | None = None) -> dict | None:
+    """whoop-poc/workout@2: one workout's computed detail (definitions in COACH.md, "Workout detail").
+    kind "lift" swaps the cardio fields for set detection. series "1m" or "10s" adds an HR array."""
+    x = find_workout(win, t)
+    if x is None:
         return None
-    x = min(near, key=dist)
-    peak = max((s.hr for s in win.r.samples if x["start_unix"] <= s.unix < x["end_unix"]), default=None)
-    return {"schema": WORKOUT_SCHEMA, "tz": TZ_NAME, **x, "peak_hr_1s": peak,
-            "zones": {"max_hr": w.MAX_HR, "rest_hr": w.REST_HR},
-            "hr_per_minute": [[m.t, round(m.hr)] for m in win.mins if x["start_unix"] <= m.t < x["end_unix"]]}
+    a, b = x["start_unix"], x["end_unix"]
+    hr = wd.hr_seconds(win.r.samples, a - 60, b + 600)
+    inside = {u: v for u, v in hr.items() if a <= u < b}
+    doc = {"schema": WORKOUT_SCHEMA, "tz": TZ_NAME, **x, "kind": kind,
+           "peak_hr_5s": wd.peak_5s(inside), "peak_hr_1s": max(inside.values(), default=None), "zones": zones()}
+    if kind == "lift":
+        doc["lifting"] = wd.lift_sets(win.r.samples, a, b)
+    else:
+        end = wd.effort_end(hr, a, b, x["avg_hr"])
+        segs = wd.intervals(hr, a, end) if end else []
+        imu = wd.load_imu(db, a, end or b) if db else []
+        doc.update(z4_plus_min=wd.z4_plus_min(inside),
+                   effort_end_unix=end,
+                   effort_end_local=None if end is None else datetime.fromtimestamp(end, TZ).strftime("%H:%M:%S"),
+                   recovery=wd.recovery(hr, end),
+                   drift=wd.drift(hr, a, end, bool(segs)) if end else {"steady": False, "drift_bpm": None,
+                                                                       "why": "no effort end found"},
+                   intervals=[{**g, "local": datetime.fromtimestamp(g["start_unix"], TZ).strftime("%H:%M:%S")}
+                              for g in segs],
+                   cadence=wd.cadence(imu))
+    if series == "1m":
+        doc["hr_per_minute"] = [[m.t, round(m.hr)] for m in win.mins if a <= m.t < b]
+    elif series == "10s":
+        doc["hr_10s"] = [[u, round(v)] for u, v in wd.bins(hr, a, b + 180)]
+    return doc
 
 
 # --------------------------------------------------------------------------------------- archive
@@ -504,7 +546,7 @@ def confirm(a, rest: list[str], now: int) -> tuple[dict, int]:
     t = parse_time(rest[1], now)
     d = local_date(t)
     win = load(a.db, d, min(now, day_bounds(d)[1] + 6 * 3600), address=a.address, heuristic=a.heuristic)
-    x = workout_view(win, t)
+    x = find_workout(win, t)
     confs = load_confirmations()
     key = x["start_unix"] if x else t
     keep = [c for c in confs if abs(c["start_unix"] - key) > CONFIRM_MATCH_S]
@@ -522,17 +564,18 @@ def confirm(a, rest: list[str], now: int) -> tuple[dict, int]:
     written = patch_written(keep)
     workout = None
     if x:
-        workout = {k: v for k, v in apply_confirmations([x], keep)[0].items()
-                   if k not in ("schema", "tz", "zones", "hr_per_minute", "peak_hr_1s")}
+        workout = apply_confirmations([x], keep)[0]
     return {"schema": CONFIRM_SCHEMA, "cleared" if clear else "recorded": True, "workout": workout,
             "file": str(confirm_path()), "rewritten": [p.name for p in written]}, 0
 
 
 # ------------------------------------------------------------------------------------------- CLI
 def parse_time(s: str, now: int) -> int:
-    """unix seconds, 'YYYY-MM-DDTHH:MM[:SS]' or 'HH:MM' (today), local times in TZ."""
+    """unix seconds, a workout ID 'YYYY-MM-DD-HHMM', 'YYYY-MM-DDTHH:MM[:SS]' or 'HH:MM' (today), local times in TZ."""
     if s.isdigit():
         return int(s)
+    if len(s) == 15 and s[10] == "-" and s[11:].isdigit():
+        return int(datetime.strptime(s, "%Y-%m-%d-%H%M").replace(tzinfo=TZ).timestamp())
     if len(s) <= 5 and ":" in s:
         h, m = map(int, s.split(":"))
         return int(datetime.combine(local_date(now), datetime.min.time(), tzinfo=TZ).replace(hour=h, minute=m).timestamp())
@@ -561,13 +604,16 @@ def run(a, rest: list[str]) -> tuple[dict, int]:
         t = parse_time(rest[1], now)
         d = local_date(t)
         win = load(a.db, d, min(now, day_bounds(d)[1] + 6 * 3600), **kw)
-        doc = workout_view(win, t)
+        kind, series = getattr(a, "kind", None), getattr(a, "series", None)
+        if kind not in (None, *WORKOUT_KINDS) or series not in (None, *SERIES):
+            return {"error": f"--kind is one of {', '.join(WORKOUT_KINDS)}; --series one of {', '.join(SERIES)}"}, 2
+        doc = workout_view(win, t, kind, series, db=None if a.demo else a.db)
         if doc is None:
             return {"error": f"no workout within 15 min of {rest[1]}", "workouts": win.day_workouts(d)}, 1
         return doc, 0
     if sub == "confirm" and len(rest) == 2:
         return confirm(a, rest, now)
-    return {"error": "usage: whoop-poc coach [since <unix> | day <YYYY-MM-DD|today|yesterday> | workout <unix|HH:MM|ISO>"
+    return {"error": "usage: whoop-poc coach [since <unix> | day <YYYY-MM-DD|today|yesterday> | workout <id|unix|HH:MM|ISO> [--kind run|lift] [--series 1m|10s]"
                      " | confirm <start> (--minutes N [--start HH:MM] | --clear)]"}, 2
 
 
