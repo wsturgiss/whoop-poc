@@ -1033,7 +1033,7 @@ def write_json(path: Path, doc: dict, compact: bool = False) -> None:
 
 
 def run_serve(args) -> None:
-    """Tiny localhost-only JSON endpoint: GET /v1/coach[?since=UNIX] (snapshot@2), GET /v1/snapshot[?hours=N]
+    """Tiny localhost-only JSON endpoint: GET /v1/coach[?since=UNIX] (snapshot@3), GET /v1/snapshot[?hours=N]
     (per-minute snapshot@1), GET /healthz."""
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

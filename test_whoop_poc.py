@@ -290,7 +290,7 @@ class HRChart(unittest.TestCase):
 
 
 class Coach(unittest.TestCase):
-    """coach.py: the LLM-facing summary (snapshot@2), drill-downs and the daily archive. Synthetic data."""
+    """coach.py: the LLM-facing summary (snapshot@3), drill-downs and the daily archive. Synthetic data."""
 
     @staticmethod
     def ts(*a):
@@ -353,14 +353,14 @@ class Coach(unittest.TestCase):
         win, days = self.week(now)
         doc = coach.summary(win, days)
         raw = json.dumps(doc, separators=(",", ":"))
-        self.assertLess(len(raw), 3072, len(raw))      # 3 KiB with a workout every day
-        self.assertEqual(doc["schema"], "whoop-poc/snapshot@2")
+        self.assertLess(len(raw), 3584, len(raw))      # soft target (COACH.md): 3.5 KB for 7 full days
+        self.assertEqual(doc["schema"], "whoop-poc/snapshot@3")
         self.assertEqual(len(doc["days"]), 7)
         self.assertEqual(len(doc["workouts"]["rows"]), 7)
         self.assertNotIn("per_minute", raw)
         today = doc["days"][-1]
         self.assertTrue(today["open"])
-        self.assertEqual((today["sleep"]["asleep_min"], today["zone_min"]), (420, {"Z2": 40}))
+        self.assertEqual((today["sleep"]["asleep_min"], today["zone_min"], today["active_min"]), (420, {"Z2": 40}, 40))
         x = dict(zip(doc["workouts"]["cols"], doc["workouts"]["rows"][-1]))
         self.assertEqual((x["local"], x["duration_min"], x["avg_hr"]), ("11-11 18:00-18:40", 40, 150))
         self.assertEqual(doc["trends"]["rest_hr"]["delta"], 0)
@@ -397,7 +397,7 @@ class Coach(unittest.TestCase):
         self.assertFalse((out / "2026-10-01.json").exists())
         self.assertTrue((out / "2026-10-20.json").exists())
         y = json.loads((out / "2026-11-10.json").read_text())
-        self.assertEqual((y["schema"], y["final"]), ("whoop-poc/day@1", True))
+        self.assertEqual((y["schema"], y["final"]), ("whoop-poc/day@2", True))
         self.assertEqual(len(y["hr_per_minute"]), 1440)
         self.assertEqual(os.stat(out / "2026-11-10.json").st_mode & 0o777, 0o600)
         self.assertTrue(all(t > y["start_unix"] for t, _ in y["hr_per_minute"][1:]))
@@ -518,7 +518,9 @@ class Coach(unittest.TestCase):
         self.assertIsNone(win.active_min(date(2026, 11, 8)))          # no worn minute: no data, not 0
         loose = self.ts(2026, 11, 11, 12, 0)                          # one Z1+ minute outside any workout
         next(m for m in win.mins if m.t == loose).hr = 130.0
-        t = coach.summary(win, days)["trends"]["active_min"]
+        doc = coach.summary(win, days)
+        self.assertEqual([r["active_min"] for r in doc["days"]], [30, 21])
+        t = doc["trends"]["active_min"]
         self.assertEqual((t["latest"], t["n"], t["baseline"], t["delta"]), (21, 1, None, None))   # open day is the latest
         self.assertIn("has 1", t["why"])
         t = coach.summary(*self.week(self.ts(2026, 11, 11, 20, 0)))["trends"]["active_min"]
@@ -583,7 +585,7 @@ class Coach(unittest.TestCase):
         out = self.dir / "coach.json"
         w.main(["json", "--demo", "--heuristic", "--out", str(out)])
         doc = json.loads(out.read_text())
-        self.assertEqual(doc["schema"], "whoop-poc/snapshot@2")
+        self.assertEqual(doc["schema"], "whoop-poc/snapshot@3")
         self.assertTrue(doc["demo"])
         self.assertFalse((self.dir / "daily").exists())        # demo data is never archived
         buf = io.StringIO()

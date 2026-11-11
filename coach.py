@@ -4,7 +4,7 @@ Coach is an LLM assistant, so the summary carries per-day rows and detected work
 arrays. Per-minute HR and sleep stage segments live in whoop.db and in the daily archive files
 (daily/YYYY-MM-DD.json). Schemas and the read flow are documented in COACH.md.
 
-  whoop-poc coach                      summary of the last WHOOP_COACH_DAYS days (whoop-poc/snapshot@2)
+  whoop-poc coach                      summary of the last WHOOP_COACH_DAYS days (whoop-poc/snapshot@3)
   whoop-poc coach since <unix>         the same, keeping only records that end after <unix>
   whoop-poc coach day YYYY-MM-DD       one day: summary row, sleep, workouts, gaps, hourly HR
   whoop-poc coach workout <start>      one workout with HR at 1-min resolution
@@ -24,9 +24,9 @@ from zoneinfo import ZoneInfo
 
 import whoop_poc as w     # importing it loads ~/.config/whoop-poc/env into os.environ
 
-SUMMARY_SCHEMA = "whoop-poc/snapshot@2"
-DAY_SCHEMA = "whoop-poc/day@1"
-DAY_VIEW_SCHEMA = "whoop-poc/day-view@1"
+SUMMARY_SCHEMA = "whoop-poc/snapshot@3"
+DAY_SCHEMA = "whoop-poc/day@2"
+DAY_VIEW_SCHEMA = "whoop-poc/day-view@2"
 WORKOUT_SCHEMA = "whoop-poc/workout@1"
 CONFIRM_SCHEMA = "whoop-poc/workout-confirm@1"
 CONFIRM_FILE = "workout-confirm.json"     # in w.STATE_DIR, next to coach.json; never in whoop.db
@@ -258,6 +258,7 @@ class Window:
             z = zone_min(mins)
             if z:
                 row["zone_min"] = z
+        row["active_min"] = self.active_min(d)
         sleep = self.day_sleep(d)
         nights = [s for s in sleep if is_night(s)]
         if nights:
@@ -293,11 +294,11 @@ def table(records: list[dict], cols: list[str]) -> dict:
     return {"cols": cols, "rows": [[x[c] for c in cols] for x in records]}
 
 
-def trends(rows: list[dict], win: Window) -> dict:
+def trends(rows: list[dict]) -> dict:
     """Latest value of a few metrics against the mean of the earlier days that have it. n counts those
     earlier days; baseline and delta stay null (with `why`) until n >= MIN_BASELINE_N."""
     def active(r):    # an open day is partial: it can be the latest, never part of the baseline
-        return None if r.get("open") and r is not rows[-1] else win.active_min(date.fromisoformat(r["date"]))
+        return None if r.get("open") and r is not rows[-1] else r.get("active_min")
     metrics = {
         "rest_hr": (lambda r: r.get("rest_hr"), "days"),
         "sleep_asleep_min": (lambda r: r.get("sleep", {}).get("asleep_min"), "nights"),
@@ -342,13 +343,13 @@ def freshness(win: Window) -> dict:
 
 
 def summary(win: Window, days: list[date], since: int | None = None) -> dict:
-    """whoop-poc/snapshot@2. With `since`, only records ending after it (days still open count), plus
+    """whoop-poc/snapshot@3. With `since`, only records ending after it (days still open count), plus
     workouts confirmed after it."""
     rows = [win.day_row(d) for d in days]
     first = day_bounds(days[0])[0]
     workouts = [x for x in win.workouts if x["start_unix"] >= first]
     gaps = [g for g in win.gaps if g["end_unix"] > first]
-    trend = trends(rows, win)
+    trend = trends(rows)
     if since is not None:
         rows = [r for r in rows if day_bounds(date.fromisoformat(r["date"]))[1] > since]
         recent = {workouts[i]["start_unix"] for i, c in match_confirmations(workouts, win.confirmations).items()
@@ -375,7 +376,7 @@ def summary(win: Window, days: list[date], since: int | None = None) -> dict:
 
 
 def day_doc(win: Window, d: date) -> dict:
-    """whoop-poc/day@1: the archive file for one local day, per-minute HR and stage segments included."""
+    """whoop-poc/day@2: the archive file for one local day, per-minute HR and stage segments included."""
     a, b = day_bounds(d)
     labels = [{"start_unix": x, "end_unix": y, "activity": act}
               for x, y, act in win.r.meta.get("labels", []) if y > a and x < b]
@@ -392,7 +393,7 @@ def day_doc(win: Window, d: date) -> dict:
 
 
 def day_view(win: Window, d: date) -> dict:
-    """whoop-poc/day-view@1: one day small enough for Coach to read: hourly HR instead of per-minute."""
+    """whoop-poc/day-view@2: one day small enough for Coach to read: hourly HR instead of per-minute."""
     hours: dict[int, list[w.Minute]] = {}
     for m in win.day_mins(d):
         hours.setdefault(m.t // 3600 * 3600, []).append(m)

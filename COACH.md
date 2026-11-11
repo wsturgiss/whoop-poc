@@ -1,18 +1,18 @@
 # Reading WHOOP data from another program (Coach)
 
 Coach is an LLM assistant, so what it reads by default is a **summary**: one row per day, detected
-workouts, data gaps, freshness and trends. It is under ~3 KB for a full week. Per-minute HR and sleep
+workouts, data gaps, freshness and trends: about 2–3.5 KB for a week (see [Size](#size)). Per-minute HR and sleep
 stage segments stay in `whoop.db` and the daily archive, and Coach asks for them one small piece at a
 time. Never scrape the TUI or HTML.
 
 | What | How | Size |
 |---|---|---|
-| **Summary** (`whoop-poc/snapshot@2`) | file `~/.local/state/whoop-poc/coach.json`, or `whoop-poc coach`, or `GET http://127.0.0.1:8787/v1/coach` | ≤ ~3 KB |
+| **Summary** (`whoop-poc/snapshot@3`) | file `~/.local/state/whoop-poc/coach.json`, or `whoop-poc coach`, or `GET http://127.0.0.1:8787/v1/coach` | ~2–3.5 KB |
 | New since a cursor | `whoop-poc coach since <cursor_unix>`, or `GET /v1/coach?since=<unix>` | smaller |
 | One day | `whoop-poc coach day 2026-11-11` (also `today`, `yesterday`) | ~1–2 KB |
 | One workout, 1-min HR | `whoop-poc coach workout <start_unix \| HH:MM \| 2026-11-11T08:24>` | < 1 KB for 20 min |
 | Record Will's duration | `whoop-poc coach confirm <start> --minutes N [--start HH:MM]`; `--clear` removes it | < 1 KB |
-| Daily archive (`whoop-poc/day@1`) | `~/.local/state/whoop-poc/daily/YYYY-MM-DD.json` | ~15–25 KB per day |
+| Daily archive (`whoop-poc/day@2`) | `~/.local/state/whoop-poc/daily/YYYY-MM-DD.json` | ~15–25 KB per day |
 | Per-minute snapshot (`whoop-poc/snapshot@1`) | `whoop-poc json --raw [--hours 24]`, `GET /v1/snapshot?hours=24` | ~45 KB per day |
 
 `whoop-sync.service` refreshes `coach.json` and the archive after every sync attempt (`ExecStopPost`
@@ -58,11 +58,11 @@ newer than the cursor is ever skipped.
   Zones are by heart-rate reserve: zone low bound = `rest_hr + fraction × (max_hr − rest_hr)`, with
   Z1–Z5 at 50/60/70/80/90%. `zones` in the summary gives the bpm bounds in use.
 
-## Summary: `whoop-poc/snapshot@2`
+## Summary: `whoop-poc/snapshot@3`
 
 ```jsonc
 {
-  "schema": "whoop-poc/snapshot@2", "demo": false,
+  "schema": "whoop-poc/snapshot@3", "demo": false,
   "generated_unix": 1794408430, "tz": "America/New_York",
   "window": {"since_unix": …,          // local midnight, `days` calendar days ago incl. today
              "days": 7,                  // WHOOP_COACH_DAYS
@@ -85,6 +85,7 @@ newer than the cursor is ever skipped.
     "rest_hr": 62,                       // ~5th pct of still minutes; only with ≥ 120 worn min
     "avg_hr": 76, "max_hr": 172,
     "zone_min": {"Z1": 5, "Z3": 14},     // minutes per zone, zeros left out
+    "active_min": 24,                    // workout duration_min + Z1+ minutes outside workouts (see Trends)
     "sleep": {                           // the longest night ending this day (last night belongs to today); naps excluded
       "start_unix": …, "end_unix": …, "local": "23:59-08:16",   // in bed = start..end
       "asleep_min": 404, "eff_pct": 81,
@@ -118,7 +119,7 @@ is covered by a gap in `gaps`. Days with data still report `unworn_min` for stra
 that have it (no_data days and days without a night never count). `baseline` (their mean) and `delta`
 are reported only when `n ≥ 3`; otherwise both are `null` and `why` says how many there are. Don't
 describe a change from a null baseline.
-- `active_min` per day = `duration_min` of the workouts starting that day (Will's confirmed minutes
+- `active_min` (also in each day row) = `duration_min` of the workouts starting that day (Will's confirmed minutes
   where confirmed, else detected) + minutes at or above Z1 outside any detected workout window. Today
   can be `latest` while still open (partial); open days never enter the baseline.
 - `sleep_*` use the row's `sleep`, which is nights only.
@@ -165,7 +166,7 @@ Exit 1 if there is no workout (or, with `--clear`, no confirmation) there; exit 
 
 ## Drill-downs
 
-`whoop-poc coach day <date>` → `whoop-poc/day-view@1`:
+`whoop-poc coach day <date>` → `whoop-poc/day-view@2`:
 `{date, tz, final, summary (the day row), sleep: [every session ending that day, same shape as the row's
 sleep plus "night": true|false], workouts: [objects with the summary's columns as keys], gaps, hourly: {cols: [start_unix, local,
 worn_min, avg_hr, max_hr], rows}, archive: "<path of the day file>"}`.
@@ -175,18 +176,18 @@ or starts or ends within 15 min of it. Fields are the summary's workout columns 
 `zones` and `hr_per_minute: [[minute_start_unix, bpm], …]` for the workout only. No match → exit 1 with
 `{"error", "workouts": [that day's workouts]}`.
 
-## Daily archive: `whoop-poc/day@1`
+## Daily archive: `whoop-poc/day@2`
 
 `~/.local/state/whoop-poc/daily/YYYY-MM-DD.json`, one per local day with data, written by
 `whoop-poc json --out` (the service) for every day in the summary window.
 
 ```jsonc
 {
-  "schema": "whoop-poc/day@1", "date": "2026-11-10", "tz": "America/New_York",
+  "schema": "whoop-poc/day@2", "date": "2026-11-10", "tz": "America/New_York",
   "start_unix": …, "end_unix": …,        // 23 or 25 h on DST change days
   "final": true,                         // the day is over and the strap was drained past its end
   "generated_unix": …, "newest_sample_unix": …,
-  "summary": {…},                        // the day row, as in snapshot@2
+  "summary": {…},                        // the day row, as in snapshot@3
   "workouts": [{…}],                     // objects, keys = the summary's workout columns
   "gaps": [{…}],
   "sleep": {"source": "noop|heuristic", "sessions": [{   // sessions ending this day
@@ -203,6 +204,27 @@ or starts or ends within 15 min of it. Fields are the summary's workout columns 
   written, with `final: false`.
 - Files older than `WHOOP_ARCHIVE_DAYS` (default 30) days are deleted on each write.
 - Days with no data at all get no file.
+
+## Size
+
+The summary carries what Coach needs for common questions (how did I sleep, how active was I on a
+given day, is resting HR drifting, did the strap sync) without a drill-down, and nothing per-minute.
+Soft target: **about 3.5 KB for the default 7-day window** with a workout, a night and full wear
+every day (3.1 KB measured), plus about 330 B for each extra day of `WHOOP_COACH_DAYS`. Real weeks
+with less wear or fewer workouts are smaller (2.0 KB on 2026-11-11). A test fails above 3.5 KiB for
+the full synthetic week; a field added to every day row should earn its bytes by answering a common
+question.
+
+## Versions
+
+- **`snapshot@3`, `day@2`, `day-view@2`** (2026-11-11). Meaning changes: a day with no worn minute
+  is `no_data: true` with no `worn_min` (was `worn_min: 0`); the row's `sleep` and the sleep trends
+  are nights only (naps move to `nap_min`); trend `n` counts earlier days with data and `baseline` /
+  `delta` are `null` below 3; `active_min` counts workout `duration_min` plus Z1+ minutes outside
+  workouts, and today can be its `latest`. Added: row `active_min`, `nap_min`, `freshness.hint`,
+  trend `why`, session `night`. Archive files marked `final` before this keep `day@1` and its
+  meanings until they age out after 30 days; check `schema` per file.
+- `snapshot@2`, `day@1`, `day-view@1`: the previous versions.
 
 ## Per-minute snapshot: `whoop-poc/snapshot@1`
 

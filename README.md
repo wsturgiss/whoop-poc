@@ -9,7 +9,7 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
 - **HTML** is a single static page with an HR chart, shaded sleep windows, a stage hypnogram per session and a sleep table, with light and dark themes.
 - **summary** is a plain-text printout.
 - **coach** prints a compact summary for an LLM assistant (per-day rows, detected workouts, gaps,
-  freshness, trends; ≤ ~3 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
+  freshness, trends; ~2–3.5 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
   `coach workout <start>`. **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
   with per-minute HR; `json --raw` and **serve** also give the per-minute snapshot. The contract is in [COACH.md](COACH.md).
 
