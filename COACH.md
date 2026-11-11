@@ -11,6 +11,7 @@ time. Never scrape the TUI or HTML.
 | New since a cursor | `whoop-poc coach since <cursor_unix>`, or `GET /v1/coach?since=<unix>` | smaller |
 | One day | `whoop-poc coach day 2026-11-11` (also `today`, `yesterday`) | ~1–2 KB |
 | One workout, 1-min HR | `whoop-poc coach workout <start_unix \| HH:MM \| 2026-11-11T08:24>` | < 1 KB for 20 min |
+| Record Will's duration | `whoop-poc coach confirm <start> --minutes N [--start HH:MM]`; `--clear` removes it | < 1 KB |
 | Daily archive (`whoop-poc/day@1`) | `~/.local/state/whoop-poc/daily/YYYY-MM-DD.json` | ~15–25 KB per day |
 | Per-minute snapshot (`whoop-poc/snapshot@1`) | `whoop-poc json --raw [--hours 24]`, `GET /v1/snapshot?hours=24` | ~45 KB per day |
 
@@ -25,14 +26,19 @@ never committed. All CLI drill-downs print one line of compact JSON to stdout.
    believing anything: a large `data_age_min` means the strap hasn't synced (see `last_sync.outcome`).
 2. **Remember `cursor_unix`.** It is the newest sample's time. Store it as `last_seen`.
 3. **Next time, fetch only what's new.** Run `whoop-poc coach since <last_seen>`. It returns the same
-   document, with `days`, `workouts` and `gaps` limited to records that end after `last_seen`. An open
+   document, with `days`, `workouts` and `gaps` limited to records that end after `last_seen` (plus
+   workouts confirmed after it). An open
    day (today) always comes back, because its numbers grow. Returned records replace what you have:
    a day row with the same `date`, or a workout with the same `start_unix`, supersedes the old one.
 4. **If `last_seen` is older than the summary window** (`window.since_unix`), `since` already reaches
    back up to 30 days from the DB. For anything older, or if Coach can only read files, read
    `daily/YYYY-MM-DD.json` for each missing date. Those files keep per-minute HR, so read them only for
    the days you need.
-5. **Drill down only when a question needs it**: `coach day <date>` for one day's hourly HR and all its
+5. **Confirm new workouts.** For each workout with `needs_confirm: true`, ask Will how long it
+   really was (and when it started, if the detected start looks off), then record his answer:
+   `whoop-poc coach confirm <start_unix> --minutes N [--start HH:MM]`. Ask once per workout; a
+   confirmed one has `needs_confirm: false`. See [Confirmed durations](#confirmed-durations).
+6. **Drill down only when a question needs it**: `coach day <date>` for one day's hourly HR and all its
    sleep sessions, `coach workout <start_unix>` for a workout's minute-by-minute HR.
 
 Using data time (`cursor_unix`) rather than read time as the cursor matters: the strap is drained in
@@ -82,8 +88,10 @@ newer than the cursor is ever skipped.
       "stage_min": {"wake": 11, "rem": 40, "light": 150, "deep": 47}},   // NOOP stager only
     "sleep_sessions": 2                  // present when more than one session ended this day
   }],
-  "workouts": {"cols": ["start_unix", "end_unix", "local", "duration_min", "avg_hr", "max_hr", "zone_min"],
-               "rows": [[1794403440, 1794404760, "11-11 08:24-08:46", 22, 157, 172, {"Z1": 2, "Z2": 2, "Z3": 14, "Z4": 4}]]},
+  "workouts": {"cols": ["start_unix", "end_unix", "local", "duration_min", "avg_hr", "max_hr", "zone_min",
+                        "detected_min", "needs_confirm"],
+               "rows": [[1794403440, 1794404760, "11-11 08:24-08:46", 20, 157, 172, {"Z1": 2, "Z2": 2, "Z3": 14, "Z4": 4},
+                         22, false]]},   // duration_min = Will's 20; detected_min = the HR window, 22
   "gaps": [{"start_unix": …, "end_unix": …, "local": "13:05-15:40", "min": 155}],   // ≥ 30 min without worn data
   "trends": {                            // latest value vs the mean of the earlier days that have it
     "rest_hr":          {"latest": 62,  "baseline": 64.0, "delta": -2.0, "n": 6},
@@ -102,6 +110,33 @@ walk can qualify. Lifting with short sets may not. `max_hr` is a 1-minute mean; 
 
 **Gaps** are stretches of 30 min or more with no worn HR between the first and newest data. Time after
 the newest sample isn't a gap; it's `freshness.data_age_min`.
+
+## Confirmed durations
+
+The detected window is when HR was elevated, which is not always when the workout was (warm-up,
+cool-down, a stop at a light). When Will gives the real duration, Coach records it and it overrides
+the detected one everywhere:
+
+```
+whoop-poc coach confirm 1794403440 --minutes 20             # start: unix, HH:MM (today) or 2026-11-11T08:24
+whoop-poc coach confirm 2026-11-11T08:24 --minutes 20 --start 08:25
+whoop-poc coach confirm 2026-11-11T08:24 --clear
+```
+
+`<start>` picks the detected workout as `coach workout` does (containing it, or within 15 min).
+Output is `whoop-poc/workout-confirm@1`: `{recorded|cleared: true, workout: {…}, file, rewritten}`.
+Exit 1 if there is no workout (or, with `--clear`, no confirmation) there; exit 2 on bad usage.
+
+- Workout fields: `duration_min` is the confirmed minutes when `confirmed`, otherwise the detected
+  ones; `detected_min` is always the HR-elevated window; `needs_confirm` is `true` until Will confirms.
+  Objects (day files, `coach day`, `coach workout`) also carry `confirmed` and `confirmed_start_unix`
+  (`null` unless `--start` was given). `start_unix`, `end_unix` and `local` stay the detected window,
+  so `start_unix` still identifies the workout.
+- Confirmations live in `~/.local/state/whoop-poc/workout-confirm.json`, not in `whoop.db`, so
+  re-detection and archive rewrites don't lose them. Each is matched to the detected workout whose
+  start is nearest, within 10 min, so it still applies if detection shifts a little.
+- `confirm` rewrites `coach.json` and every `daily/` file it affects at once, final ones included
+  (they keep `final: true`). Later syncs apply confirmations the same way.
 
 ## Drill-downs
 

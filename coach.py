@@ -8,6 +8,8 @@ arrays. Per-minute HR and sleep stage segments live in whoop.db and in the daily
   whoop-poc coach since <unix>         the same, keeping only records that end after <unix>
   whoop-poc coach day YYYY-MM-DD       one day: summary row, sleep, workouts, gaps, hourly HR
   whoop-poc coach workout <start>      one workout with HR at 1-min resolution
+  whoop-poc coach confirm <start> --minutes N [--start HH:MM]
+                                       record the wearer's confirmed duration (--clear removes it)
 """
 from __future__ import annotations
 
@@ -25,6 +27,8 @@ SUMMARY_SCHEMA = "whoop-poc/snapshot@2"
 DAY_SCHEMA = "whoop-poc/day@1"
 DAY_VIEW_SCHEMA = "whoop-poc/day-view@1"
 WORKOUT_SCHEMA = "whoop-poc/workout@1"
+CONFIRM_SCHEMA = "whoop-poc/workout-confirm@1"
+CONFIRM_FILE = "workout-confirm.json"     # in w.STATE_DIR, next to coach.json; never in whoop.db
 
 TZ_NAME = os.environ.get("WHOOP_TZ", "America/New_York")    # local day boundaries for rows and the archive
 TZ = ZoneInfo(TZ_NAME)
@@ -36,6 +40,7 @@ WORKOUT_MERGE_GAP_MIN = 3       # elevated runs separated by less than this are 
 GAP_MIN = 30                    # stretches without worn data at least this long are reported as gaps
 MIN_REST_WORN_MIN = 120         # a day row reports rest_hr only with at least this much wear
 SLEEP_LEAD_S = 12 * 3600        # load this much before the first day so its night is detected whole
+CONFIRM_MATCH_S = 10 * 60       # a confirmation applies to the detected workout starting nearest, within this
 
 
 # ------------------------------------------------------------------------------------------- time
@@ -121,15 +126,72 @@ def sleep_brief(s: w.SleepWindow) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------------- confirmations
+# A confirmation is the wearer's own duration for one detected workout:
+#   {"start_unix": detected start when confirmed, "minutes": N, "actual_start_unix": unix | absent, "set_unix": …}
+# It is matched to workouts by start_unix within CONFIRM_MATCH_S, so it still applies after re-detection.
+CONFIRM_KEYS = ("detected_min", "confirmed", "needs_confirm", "confirmed_start_unix")
+
+
+def confirm_path() -> Path:
+    return w.STATE_DIR / CONFIRM_FILE
+
+
+def load_confirmations(path: Path | None = None) -> list[dict]:
+    try:
+        return list(json.loads((path or confirm_path()).read_text()).get("workouts", []))
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def save_confirmations(items: list[dict], path: Path | None = None) -> None:
+    w.write_json(path or confirm_path(), {"schema": CONFIRM_SCHEMA,
+                                          "workouts": sorted(items, key=lambda c: c["start_unix"])})
+
+
+def match_confirmations(workouts: list[dict], confs: list[dict]) -> dict[int, dict]:
+    """{index into workouts: confirmation}. Each confirmation goes to the workout whose start is nearest
+    (within CONFIRM_MATCH_S); a workout claimed by two keeps the nearer one."""
+    out: dict[int, tuple[int, dict]] = {}
+    for c in confs:
+        near = [(abs(x["start_unix"] - c["start_unix"]), i) for i, x in enumerate(workouts)
+                if abs(x["start_unix"] - c["start_unix"]) <= CONFIRM_MATCH_S]
+        if not near:
+            continue
+        d, i = min(near)
+        if i not in out or d < out[i][0]:
+            out[i] = (d, c)
+    return {i: c for i, (_, c) in out.items()}
+
+
+def apply_confirmations(workouts: list[dict], confs: list[dict]) -> list[dict]:
+    """Workouts with duration_min = the confirmed minutes where confirmed, else the detected minutes.
+    detected_min keeps the HR-elevated window's length; needs_confirm marks the ones to ask about.
+    Accepts workouts that already went through this (archive files): it starts from detected_min."""
+    matched = match_confirmations(workouts, confs)
+    out = []
+    for i, x in enumerate(workouts):
+        y = {k: v for k, v in x.items() if k not in CONFIRM_KEYS}
+        detected = x.get("detected_min", x["duration_min"])
+        c = matched.get(i)
+        y.update(duration_min=c["minutes"] if c else detected, detected_min=detected,
+                 confirmed=c is not None, needs_confirm=c is None,
+                 confirmed_start_unix=c.get("actual_start_unix") if c else None)
+        out.append(y)
+    return out
+
+
 class Window:
     """Everything derived once from one Report: worn minutes, workouts, gaps, sleep by wake day."""
 
-    def __init__(self, r: w.Report, now: int):
+    def __init__(self, r: w.Report, now: int, confirmations: list[dict] | None = None):
         self.r, self.now = r, now
         self.mins = r.hr_minutes
         self.newest = r.samples[-1].unix if r.samples else None
         self.drained_to = r.meta.get("newest_unix") or self.newest    # newest frame in the whole DB
-        self.workouts = detect_workouts(self.mins)
+        demo = r.meta.get("address") == "-"
+        self.confirmations = [] if demo else load_confirmations() if confirmations is None else confirmations
+        self.workouts = apply_confirmations(detect_workouts(self.mins), self.confirmations)
         self.gaps = detect_gaps(self.mins)
 
     def final(self, d: date) -> bool:
@@ -181,7 +243,10 @@ class Window:
         return row
 
 
-WORKOUT_COLS = ["start_unix", "end_unix", "local", "duration_min", "avg_hr", "max_hr", "zone_min"]
+# The summary's workout table. Objects (day files, day view, workout view) also carry `confirmed` and
+# `confirmed_start_unix`; in the table a confirmed row is one with needs_confirm false.
+WORKOUT_COLS = ["start_unix", "end_unix", "local", "duration_min", "avg_hr", "max_hr", "zone_min",
+                "detected_min", "needs_confirm"]
 
 
 def table(records: list[dict], cols: list[str]) -> dict:
@@ -229,7 +294,8 @@ def freshness(win: Window) -> dict:
 
 
 def summary(win: Window, days: list[date], since: int | None = None) -> dict:
-    """whoop-poc/snapshot@2. With `since`, only records ending after it (days still open count)."""
+    """whoop-poc/snapshot@2. With `since`, only records ending after it (days still open count), plus
+    workouts confirmed after it."""
     rows = [win.day_row(d) for d in days]
     first = day_bounds(days[0])[0]
     workouts = [x for x in win.workouts if x["start_unix"] >= first]
@@ -237,7 +303,9 @@ def summary(win: Window, days: list[date], since: int | None = None) -> dict:
     trend = trends(rows)
     if since is not None:
         rows = [r for r in rows if day_bounds(date.fromisoformat(r["date"]))[1] > since]
-        workouts = [x for x in workouts if x["end_unix"] > since]
+        recent = {workouts[i]["start_unix"] for i, c in match_confirmations(workouts, win.confirmations).items()
+                  if c.get("set_unix", 0) > since}
+        workouts = [x for x in workouts if x["end_unix"] > since or x["start_unix"] in recent]
         gaps = [g for g in gaps if g["end_unix"] > since]
     latest = win.r.hr_now
     doc = {
@@ -322,6 +390,8 @@ def write_archive(win: Window, days: list[date], out_dir: Path, keep_days: int =
         except (OSError, ValueError):
             old = None
         if old and old.get("final"):
+            if patch_day_file(p, win.confirmations, old):
+                written.append(p)
             continue
         doc = day_doc(win, d)
         if not doc["summary"]["worn_min"] and not doc["sleep"]["sessions"] and not old:
@@ -340,6 +410,74 @@ def write_archive(win: Window, days: list[date], out_dir: Path, keep_days: int =
     return written
 
 
+def patch_day_file(p: Path, confs: list[dict], doc: dict | None = None) -> bool:
+    """Re-apply confirmations to an archive file's workouts; rewrite it (keeping `final`) if they changed."""
+    try:
+        doc = doc if doc is not None else json.loads(p.read_text())
+    except (OSError, ValueError):
+        return False
+    new = apply_confirmations(doc.get("workouts", []), confs)
+    if new == doc.get("workouts", []):
+        return False
+    w.write_json(p, {**doc, "workouts": new}, compact=True)
+    return True
+
+
+def patch_written(confs: list[dict]) -> list[Path]:
+    """After a confirm: re-apply confirmations to coach.json and every daily/ file, without reading the DB,
+    so Coach sees the change before the next sync rewrites them. Returns the paths rewritten."""
+    written = [p for p in sorted((w.STATE_DIR / "daily").glob("*.json")) if patch_day_file(p, confs)]
+    p = w.STATE_DIR / "coach.json"
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return written
+    if doc.get("demo") or "workouts" not in doc:
+        return written
+    old = doc["workouts"]
+    new = table(apply_confirmations([dict(zip(old["cols"], r)) for r in old["rows"]], confs), WORKOUT_COLS)
+    if new != old:
+        w.write_json(p, {**doc, "workouts": new}, compact=True)
+        written.append(p)
+    return written
+
+
+def confirm(a, rest: list[str], now: int) -> tuple[dict, int]:
+    """`coach confirm <start> --minutes N [--start HH:MM]` or `coach confirm <start> --clear`."""
+    if a.demo:
+        return {"error": "confirm writes the wearer's confirmations; not with --demo"}, 2
+    minutes, clear = getattr(a, "minutes", None), getattr(a, "clear", False)
+    if clear == (minutes is not None):
+        return {"error": "usage: whoop-poc coach confirm <start> (--minutes N [--start HH:MM] | --clear)"}, 2
+    if minutes is not None and not 1 <= minutes <= 24 * 60:
+        return {"error": "--minutes must be 1..1440"}, 2
+    t = parse_time(rest[1], now)
+    d = local_date(t)
+    win = load(a.db, d, min(now, day_bounds(d)[1] + 6 * 3600), address=a.address, heuristic=a.heuristic)
+    x = workout_view(win, t)
+    confs = load_confirmations()
+    key = x["start_unix"] if x else t
+    keep = [c for c in confs if abs(c["start_unix"] - key) > CONFIRM_MATCH_S]
+    if clear:
+        if len(keep) == len(confs):
+            return {"error": f"no confirmation within {CONFIRM_MATCH_S // 60} min of {rest[1]}"}, 1
+    else:
+        if x is None:
+            return {"error": f"no workout within 15 min of {rest[1]}", "workouts": win.day_workouts(d)}, 1
+        c = {"start_unix": x["start_unix"], "minutes": minutes, "set_unix": now}
+        if getattr(a, "start", None):
+            c["actual_start_unix"] = parse_time(a.start, x["start_unix"])
+        keep.append(c)
+    save_confirmations(keep)
+    written = patch_written(keep)
+    workout = None
+    if x:
+        workout = {k: v for k, v in apply_confirmations([x], keep)[0].items()
+                   if k not in ("schema", "tz", "zones", "hr_per_minute", "peak_hr_1s")}
+    return {"schema": CONFIRM_SCHEMA, "cleared" if clear else "recorded": True, "workout": workout,
+            "file": str(confirm_path()), "rewritten": [p.name for p in written]}, 0
+
+
 # ------------------------------------------------------------------------------------------- CLI
 def parse_time(s: str, now: int) -> int:
     """unix seconds, 'YYYY-MM-DDTHH:MM[:SS]' or 'HH:MM' (today), local times in TZ."""
@@ -353,7 +491,7 @@ def parse_time(s: str, now: int) -> int:
 
 
 def run(a, rest: list[str]) -> tuple[dict, int]:
-    """`whoop-poc coach [since <unix> | day <date> | workout <start>]` → (document, exit code)."""
+    """`whoop-poc coach [since <unix> | day <date> | workout <start> | confirm <start> …]` → (document, exit code)."""
     now = w.DEMO_END if a.demo else int(time.time())
     today = local_date(now)
     kw = dict(address=a.address, demo=a.demo, heuristic=a.heuristic)
@@ -377,7 +515,10 @@ def run(a, rest: list[str]) -> tuple[dict, int]:
         if doc is None:
             return {"error": f"no workout within 15 min of {rest[1]}", "workouts": win.day_workouts(d)}, 1
         return doc, 0
-    return {"error": "usage: whoop-poc coach [since <unix> | day <YYYY-MM-DD|today|yesterday> | workout <unix|HH:MM|ISO>]"}, 2
+    if sub == "confirm" and len(rest) == 2:
+        return confirm(a, rest, now)
+    return {"error": "usage: whoop-poc coach [since <unix> | day <YYYY-MM-DD|today|yesterday> | workout <unix|HH:MM|ISO>"
+                     " | confirm <start> (--minutes N [--start HH:MM] | --clear)]"}, 2
 
 
 def write_snapshot(a, out: Path, archive: bool = True) -> dict:

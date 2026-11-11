@@ -353,7 +353,7 @@ class Coach(unittest.TestCase):
         win, days = self.week(now)
         doc = coach.summary(win, days)
         raw = json.dumps(doc, separators=(",", ":"))
-        self.assertLess(len(raw), 3000, len(raw))
+        self.assertLess(len(raw), 3072, len(raw))      # 3 KiB with a workout every day
         self.assertEqual(doc["schema"], "whoop-poc/snapshot@2")
         self.assertEqual(len(doc["days"]), 7)
         self.assertEqual(len(doc["workouts"]["rows"]), 7)
@@ -405,6 +405,108 @@ class Coach(unittest.TestCase):
         self.assertEqual(coach.write_archive(win, days, out), [])
         win2, days2 = self.week(now + 600)
         self.assertEqual([p.name for p in coach.write_archive(win2, days2, out)], ["2026-11-11.json"])
+
+    def jog(self, confirmations=None, now=None):
+        """Nov 10 and 11, 75 bpm, with the Nov 11 jog at 157 bpm 08:24-08:46 ET (detected 22 min)
+        and a 30-min run at 150 bpm on Nov 10 18:00."""
+        import coach
+        from datetime import date
+        now = now or self.ts(2026, 11, 11, 20, 0)
+        days = [date(2026, 11, 10), date(2026, 11, 11)]
+        since = coach.day_bounds(days[0])[0] - coach.SLEEP_LEAD_S
+        jog = (self.ts(2026, 11, 11, 8, 24), self.ts(2026, 11, 11, 8, 46))
+        run = (self.ts(2026, 11, 10, 18, 0), self.ts(2026, 11, 10, 18, 30))
+        mins = [w.Minute(t, 157.0 if jog[0] <= t < jog[1] else 150.0 if run[0] <= t < run[1] else 75.0, 0.2, 60)
+                for t in range(since, now, 60)]
+        meta = {"address": "AA:BB", "name": "test", "newest_unix": now - 60, "labels": [], "sleep_source": "heuristic"}
+        r = w.Report(meta, since, now, [w.Sample(now - 60, 75, 0.1, -0.4, 0.91)], mins, [])
+        return coach.Window(r, now, confirmations), days, jog
+
+    def test_confirmed_duration_overrides_detected(self):
+        import coach
+        win, days, jog = self.jog()
+        self.assertEqual([(x["duration_min"], x["needs_confirm"], x["confirmed"]) for x in win.workouts],
+                         [(30, True, False), (22, True, False)])
+        # Will: exactly 20 min. Stored against a start 2 min off what detection now says: still matches.
+        conf = [{"start_unix": jog[0] + 120, "minutes": 20, "actual_start_unix": jog[0] + 60, "set_unix": 0}]
+        win, days, _ = self.jog(conf)
+        x = win.workouts[1]
+        self.assertEqual((x["duration_min"], x["detected_min"], x["confirmed"], x["needs_confirm"]), (20, 22, True, False))
+        self.assertEqual((x["start_unix"], x["confirmed_start_unix"], x["local"]), (jog[0], jog[0] + 60, "11-11 08:24-08:46"))
+        self.assertTrue(win.workouts[0]["needs_confirm"])
+        doc = coach.summary(win, days)
+        rows = [dict(zip(doc["workouts"]["cols"], r)) for r in doc["workouts"]["rows"]]
+        self.assertEqual([(r["duration_min"], r["detected_min"], r["needs_confirm"]) for r in rows],
+                         [(30, 30, True), (20, 22, False)])
+        self.assertEqual(coach.workout_view(win, jog[0])["duration_min"], 20)
+        # outside CONFIRM_MATCH_S it doesn't apply
+        far = [{**conf[0], "start_unix": jog[0] + coach.CONFIRM_MATCH_S + 60}]
+        self.assertTrue(self.jog(far)[0].workouts[1]["needs_confirm"])
+        # re-applying is stable (archive files go through it again)
+        self.assertEqual(coach.apply_confirmations(win.workouts, conf), win.workouts)
+        self.assertEqual(coach.apply_confirmations(win.workouts, [])[1]["duration_min"], 22)
+
+    def test_since_returns_workouts_confirmed_after_it(self):
+        import coach
+        since = self.ts(2026, 11, 11, 12, 0)
+        win, days, _ = self.jog()
+        self.assertEqual(coach.summary(win, days, since=since)["workouts"]["rows"], [])
+        conf = [{"start_unix": self.ts(2026, 11, 11, 8, 24), "minutes": 20, "set_unix": since + 60}]
+        win, days, _ = self.jog(conf)
+        rows = coach.summary(win, days, since=since)["workouts"]["rows"]
+        self.assertEqual([r[3] for r in rows], [20])
+
+    def test_final_archive_file_picks_up_later_confirmation(self):
+        import coach, json
+        win, days, jog = self.jog()
+        out = self.dir / "daily"
+        coach.write_archive(win, days, out, today=days[-1])
+        p = out / "2026-11-10.json"
+        self.assertTrue(json.loads(p.read_text())["final"])
+        conf = [{"start_unix": self.ts(2026, 11, 10, 18, 0), "minutes": 35, "set_unix": 0}]
+        win, days, _ = self.jog(conf)
+        self.assertIn(p, coach.write_archive(win, days, out, today=days[-1]))
+        y = json.loads(p.read_text())
+        self.assertEqual((y["final"], y["workouts"][0]["duration_min"], y["workouts"][0]["detected_min"]), (True, 35, 30))
+        self.assertEqual(coach.write_archive(win, days, out, today=days[-1]), [])     # unchanged: not rewritten
+
+    def test_cli_confirm_and_clear(self):
+        import coach, io, json
+        from contextlib import redirect_stdout
+        from unittest import mock
+        win, days, jog = self.jog()
+        db = self.dir / "whoop.db"
+        db.write_text("")
+        coach.write_archive(win, days, self.dir / "daily", today=days[-1])
+        w.write_json(self.dir / "coach.json", coach.summary(win, days), compact=True)
+
+        def cli(*args):
+            buf = io.StringIO()
+            with mock.patch.object(coach, "load", lambda *a, **k: self.jog()[0]), redirect_stdout(buf), \
+                    self.assertRaises(SystemExit) as cm:
+                w.main(["coach", "confirm", *args, "--db", str(db)])
+            return json.loads(buf.getvalue()), cm.exception.code
+
+        doc, code = cli("2026-11-11T08:24", "--minutes", "20", "--start", "08:25")
+        self.assertEqual(code, 0, doc)
+        self.assertEqual((doc["workout"]["duration_min"], doc["workout"]["detected_min"]), (20, 22))
+        self.assertEqual(doc["workout"]["confirmed_start_unix"], jog[0] + 60)
+        stored = json.loads((self.dir / "workout-confirm.json").read_text())
+        self.assertEqual(stored["schema"], "whoop-poc/workout-confirm@1")
+        self.assertEqual([(c["start_unix"], c["minutes"]) for c in stored["workouts"]], [(jog[0], 20)])
+        summ = json.loads((self.dir / "coach.json").read_text())["workouts"]
+        self.assertEqual(dict(zip(summ["cols"], summ["rows"][-1]))["duration_min"], 20)
+        day = json.loads((self.dir / "daily" / "2026-11-11.json").read_text())
+        self.assertEqual(day["workouts"][0]["duration_min"], 20)
+        # confirming again replaces, it doesn't add
+        self.assertEqual(cli("2026-11-11T08:26", "--minutes", "20")[1], 0)
+        self.assertEqual(len(json.loads((self.dir / "workout-confirm.json").read_text())["workouts"]), 1)
+        self.assertEqual(cli("2026-11-11T08:24", "--clear")[1], 0)
+        self.assertEqual(json.loads((self.dir / "workout-confirm.json").read_text())["workouts"], [])
+        self.assertEqual(json.loads((self.dir / "daily" / "2026-11-11.json").read_text())["workouts"][0]["duration_min"], 22)
+        self.assertEqual(cli("2026-11-11T08:24", "--clear")[1], 1)          # nothing left to clear
+        self.assertEqual(cli("2026-11-11T13:00", "--minutes", "20")[1], 1)  # no workout there
+        self.assertEqual(cli("2026-11-11T08:24")[1], 2)                     # neither --minutes nor --clear
 
     def test_cli_json_out_and_raw(self):
         import io, json
