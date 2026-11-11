@@ -508,6 +508,75 @@ class Coach(unittest.TestCase):
         self.assertEqual(cli("2026-11-11T13:00", "--minutes", "20")[1], 1)  # no workout there
         self.assertEqual(cli("2026-11-11T08:24")[1], 2)                     # neither --minutes nor --clear
 
+    def test_active_min_counts_confirmed_workouts_and_loose_zone_minutes(self):
+        import coach
+        from datetime import date
+        conf = [{"start_unix": self.ts(2026, 11, 11, 8, 24), "minutes": 20, "set_unix": 0}]
+        win, days, _ = self.jog(conf)
+        self.assertEqual(win.active_min(date(2026, 11, 11)), 20)      # confirmed 20 wins over detected 22
+        self.assertEqual(win.active_min(date(2026, 11, 10)), 30)
+        self.assertIsNone(win.active_min(date(2026, 11, 8)))          # no worn minute: no data, not 0
+        loose = self.ts(2026, 11, 11, 12, 0)                          # one Z1+ minute outside any workout
+        next(m for m in win.mins if m.t == loose).hr = 130.0
+        t = coach.summary(win, days)["trends"]["active_min"]
+        self.assertEqual((t["latest"], t["n"], t["baseline"], t["delta"]), (21, 1, None, None))   # open day is the latest
+        self.assertIn("has 1", t["why"])
+        t = coach.summary(*self.week(self.ts(2026, 11, 11, 20, 0)))["trends"]["active_min"]
+        self.assertEqual((t["latest"], t["baseline"], t["n"]), (40, 40, 6))
+
+    def test_short_or_daytime_sleep_is_a_nap_and_baseline_needs_three_nights(self):
+        import coach
+        from datetime import date
+        nap = w.SleepWindow(self.ts(2026, 11, 10, 19, 43), self.ts(2026, 11, 10, 20, 48))
+        day = w.SleepWindow(self.ts(2026, 11, 10, 11, 0), self.ts(2026, 11, 10, 15, 0))
+        night = w.SleepWindow(self.ts(2026, 11, 10, 23, 59), self.ts(2026, 11, 11, 8, 16))
+        self.assertEqual([coach.is_night(s) for s in (nap, day, night)], [False, False, True])
+        win, days, _ = self.jog()
+        for s in (nap, night):
+            s.minutes = [m for m in win.mins if s.start <= m.t < s.end]
+            for m in s.minutes:
+                m.asleep = True
+        win.r.sleep[:] = [nap, night]
+        rows = [win.day_row(d) for d in days]
+        self.assertNotIn("sleep", rows[0])
+        self.assertEqual(rows[0]["nap_min"], nap.asleep_min)
+        self.assertEqual(rows[1]["sleep"]["local"], "23:59-08:16")
+        t = coach.summary(win, days)["trends"]["sleep_asleep_min"]
+        self.assertEqual((t["n"], t["baseline"], t["delta"]), (0, None, None))
+        self.assertIn("nights", t["why"])
+        self.assertEqual([s["night"] for s in coach.day_view(win, date(2026, 11, 10))["sleep"]], [False])
+        t = coach.summary(*self.week(self.ts(2026, 11, 11, 20, 0)))["trends"]["sleep_asleep_min"]
+        self.assertEqual((t["n"], t["baseline"], t["delta"]), (6, 420, 0))
+        self.assertNotIn("why", t)
+
+    def test_days_without_data_are_no_data_not_worn_zero(self):
+        import coach
+        from datetime import date
+        win, _, _ = self.jog()
+        days = [date(2026, 11, 7), date(2026, 11, 8), date(2026, 11, 10)]
+        rows = coach.summary(win, days)["days"]
+        self.assertEqual(rows[0], {"date": "2026-11-07", "start_unix": coach.day_bounds(days[0])[0], "no_data": True})
+        self.assertNotIn("worn_min", rows[1])
+        self.assertEqual(rows[2]["worn_min"], 1440)
+        out = self.dir / "daily"
+        coach.write_archive(win, days, out, today=date(2026, 11, 11))
+        self.assertEqual(sorted(p.name for p in out.glob("*.json")), ["2026-11-10.json"])
+
+    def test_freshness_hint_when_not_advertising_and_stale(self):
+        import coach, socket
+        now = self.ts(2026, 11, 11, 20, 0)
+        win, _, _ = self.jog(now=now)
+        win.newest = now - 3 * 3600 - 7 * 60
+        w.write_json(self.dir / "sync.json", {"outcome": "not_advertising", "finished_unix": now})
+        f = coach.freshness(win)
+        self.assertEqual(f["hint"], f"strap out of range of {socket.gethostname()} (not advertising); "
+                                    "no new data for 3 h 7 min")
+        win.newest = now - 20 * 60                                     # not stale: no hint
+        self.assertNotIn("hint", coach.freshness(win))
+        win.newest = now - 3 * 3600
+        w.write_json(self.dir / "sync.json", {"outcome": "complete", "finished_unix": now})
+        self.assertNotIn("hint", coach.freshness(win))
+
     def test_cli_json_out_and_raw(self):
         import io, json
         from contextlib import redirect_stdout

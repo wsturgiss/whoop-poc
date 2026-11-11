@@ -24,6 +24,7 @@ never committed. All CLI drill-downs print one line of compact JSON to stdout.
 
 1. **Read the summary.** Read `coach.json` (or run `whoop-poc coach`). Check `freshness` before
    believing anything: a large `data_age_min` means the strap hasn't synced (see `last_sync.outcome`).
+   If `freshness.hint` is present, pass it on to Will as it is rather than guessing a cause.
 2. **Remember `cursor_unix`.** It is the newest sample's time. Store it as `last_seen`.
 3. **Next time, fetch only what's new.** Run `whoop-poc coach since <last_seen>`. It returns the same
    document, with `days`, `workouts` and `gaps` limited to records that end after `last_seen` (plus
@@ -69,24 +70,28 @@ newer than the cursor is ever skipped.
   "cursor_unix": 1794408217,             // newest sample; next time call `coach since <this>`
   "freshness": {"data_age_min": 3,       // now − newest sample
                 "last_sync": {"outcome": "complete|partial|not_advertising|error", "finished_unix": …},
-                "battery_pct": 44},
+                "battery_pct": 44,
+                "hint": "strap out of range of baconstation (not advertising); no new data for 3 h 7 min"},
+                                         // hint: only when last_sync is not_advertising and data is > 60 min old
   "latest_hr": {"unix": …, "bpm": 96},
   "zones": {"max_hr": 190, "rest_hr": 60, "Z1": 125, "Z2": 138, "Z3": 151, "Z4": 164, "Z5": 177},
   "sleep_source": "noop|heuristic",
   "days": [{                             // one per local day, oldest first
     "date": "2026-11-11", "start_unix": …,
     "open": true,                        // present while the day can still change (not over, or not drained past its end)
-    "worn_min": 584,                     // minutes with HR
+    "no_data": true,                     // present (alone) when the day has no worn minute at all; see below
+    "worn_min": 584,                     // minutes with HR; absent on no_data days
     "unworn_min": 19,                    // minutes without HR between the first and newest data (strap off)
     "rest_hr": 62,                       // ~5th pct of still minutes; only with ≥ 120 worn min
     "avg_hr": 76, "max_hr": 172,
     "zone_min": {"Z1": 5, "Z3": 14},     // minutes per zone, zeros left out
-    "sleep": {                           // the longest session ending this day (last night belongs to today)
+    "sleep": {                           // the longest night ending this day (last night belongs to today); naps excluded
       "start_unix": …, "end_unix": …, "local": "23:59-08:16",   // in bed = start..end
       "asleep_min": 404, "eff_pct": 81,
       "resting_hr": 49,                  // NOOP stager; the heuristic gives "avg_hr" (mean asleep HR) instead
       "stage_min": {"wake": 11, "rem": 40, "light": 150, "deep": 47}},   // NOOP stager only
-    "sleep_sessions": 2                  // present when more than one session ended this day
+    "sleep_sessions": 2,                 // present when more than one night session ended this day
+    "nap_min": 40                        // asleep minutes in naps ending this day (see Sleep below)
   }],
   "workouts": {"cols": ["start_unix", "end_unix", "local", "duration_min", "avg_hr", "max_hr", "zone_min",
                         "detected_min", "needs_confirm"],
@@ -97,11 +102,31 @@ newer than the cursor is ever skipped.
     "rest_hr":          {"latest": 62,  "baseline": 64.0, "delta": -2.0, "n": 6},
     "sleep_asleep_min": {"latest": 404, "baseline": 410.5, "delta": -6.5, "n": 6},
     "sleep_eff_pct":    {"latest": 81,  "baseline": 85.0, "delta": -4.0, "n": 6},
-    "active_min":       {"latest": 40,  "baseline": 31.2, "delta": 8.8, "n": 5}   // Z1+ minutes, complete days only
+    "active_min":       {"latest": 24,  "baseline": null, "delta": null, "n": 1,
+                         "why": "baseline needs 3 earlier days with data, has 1"}
   },
   "since_unix": …                        // only on `coach since` output
 }
 ```
+
+**Days without data.** A day with no worn minute is `{"date", "start_unix", "no_data": true}` (plus
+`open` while it can change) and nothing else: no `worn_min: 0`, because that would claim the strap was
+off. Before `window.data_since_unix` it means the DB has nothing that early. A `no_data` day after it
+is covered by a gap in `gaps`. Days with data still report `unworn_min` for strap-off minutes.
+
+**Trends.** `latest` is the last day that has the metric; `n` counts the earlier days in the window
+that have it (no_data days and days without a night never count). `baseline` (their mean) and `delta`
+are reported only when `n ≥ 3`; otherwise both are `null` and `why` says how many there are. Don't
+describe a change from a null baseline.
+- `active_min` per day = `duration_min` of the workouts starting that day (Will's confirmed minutes
+  where confirmed, else detected) + minutes at or above Z1 outside any detected workout window. Today
+  can be `latest` while still open (partial); open days never enter the baseline.
+- `sleep_*` use the row's `sleep`, which is nights only.
+
+**Sleep: nights and naps.** A session is a night when it is at least 3 h in bed and at least half
+of that falls between 20:00 and 11:00 local. Anything else is a nap: it shows in the row only as
+`nap_min`, and never in `sleep` or the sleep trends. `coach day` and the daily archive list every
+session with `"night": true|false`.
 
 **Workouts** are detected, not logged: runs of minutes at or above Z1 (50% of heart-rate reserve),
 merged across dips or dropouts shorter than 3 min, kept when the run spans at least 10 min. A brisk
@@ -142,7 +167,7 @@ Exit 1 if there is no workout (or, with `--clear`, no confirmation) there; exit 
 
 `whoop-poc coach day <date>` → `whoop-poc/day-view@1`:
 `{date, tz, final, summary (the day row), sleep: [every session ending that day, same shape as the row's
-sleep], workouts: [objects with the summary's columns as keys], gaps, hourly: {cols: [start_unix, local,
+sleep plus "night": true|false], workouts: [objects with the summary's columns as keys], gaps, hourly: {cols: [start_unix, local,
 worn_min, avg_hr, max_hr], rows}, archive: "<path of the day file>"}`.
 
 `whoop-poc coach workout <start>` → `whoop-poc/workout@1`: the workout whose span contains `<start>`
@@ -166,7 +191,7 @@ or starts or ends within 15 min of it. Fields are the summary's workout columns 
   "gaps": [{…}],
   "sleep": {"source": "noop|heuristic", "sessions": [{   // sessions ending this day
     "start_unix", "end_unix", "start_iso", "end_iso", "in_bed_min", "asleep_min", "stage_min",
-    "avg_hr", "resting_hr", "avg_hrv_ms",
+    "avg_hr", "resting_hr", "avg_hrv_ms", "night",                            // night: see Sleep: nights and naps
     "stages": [{"start_unix", "end_unix", "stage": "light|rem|deep|wake"}]}]},   // stages: NOOP only
   "labels": [{"start_unix", "end_unix", "activity"}],
   "hr_per_minute": [[minute_start_unix, mean_bpm], …]                          // worn minutes only
@@ -201,7 +226,8 @@ In `~/.config/whoop-poc/env` (or the environment):
 ## Reading it well
 
 - **Is it fresh?** `freshness.data_age_min`, then `last_sync.outcome`. `not_advertising` means the strap
-  wasn't reachable (out of range, phone holding it, asleep). `partial` means a drain stopped early, and
+  wasn't reachable (out of range, phone holding it, asleep); with stale data `freshness.hint` says so
+  in one line, naming the sync host. `partial` means a drain stopped early, and
   the next run resumes it with nothing lost. A recent `complete` with old data usually means the strap
   isn't being worn.
 - **Sleep is approximate.** NOOP's stager agrees with lab staging roughly 65–73% per 30 s epoch at best,

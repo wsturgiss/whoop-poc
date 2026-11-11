@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import statistics as st
 import time
 from datetime import date, datetime, timedelta
@@ -41,6 +42,11 @@ GAP_MIN = 30                    # stretches without worn data at least this long
 MIN_REST_WORN_MIN = 120         # a day row reports rest_hr only with at least this much wear
 SLEEP_LEAD_S = 12 * 3600        # load this much before the first day so its night is detected whole
 CONFIRM_MATCH_S = 10 * 60       # a confirmation applies to the detected workout starting nearest, within this
+NIGHT_MIN_SPAN_MIN = 180        # a sleep session shorter than this (in bed) is a nap, not a night
+NIGHT_HOURS = (20, 11)          # local evening-to-morning window [20:00, 11:00) ...
+NIGHT_MIN_FRAC = 0.5            # ... that at least this much of a night's in-bed span must fall in
+MIN_BASELINE_N = 3              # trends report a baseline and delta only with this many earlier days with data
+STALE_MIN = 60                  # data older than this, with last_sync not_advertising, gets freshness.hint
 
 
 # ------------------------------------------------------------------------------------------- time
@@ -112,6 +118,17 @@ def detect_gaps(mins: list[w.Minute]) -> list[dict]:
         if b - a >= GAP_MIN * 60:
             out.append({"start_unix": a, "end_unix": b, "local": span_local(a, b), "min": (b - a) // 60})
     return out
+
+
+def is_night(s: w.SleepWindow) -> bool:
+    """A night's sleep: in bed at least NIGHT_MIN_SPAN_MIN, mostly inside the local NIGHT_HOURS window.
+    Shorter or daytime sessions are naps: kept in drill-downs, left out of the row's sleep and trends."""
+    if s.span_min < NIGHT_MIN_SPAN_MIN:
+        return False
+    a, b = NIGHT_HOURS
+    inside = sum(1 for t in range(s.start, s.end, 60)
+                 if (h := datetime.fromtimestamp(t, TZ).hour) >= a or h < b)
+    return inside >= NIGHT_MIN_FRAC * s.span_min
 
 
 def sleep_brief(s: w.SleepWindow) -> dict:
@@ -217,11 +234,17 @@ class Window:
         return [g for g in self.gaps if g["end_unix"] > a and g["start_unix"] < b]
 
     def day_row(self, d: date) -> dict:
+        """One day's summary row. A day with no worn minute at all is {date, start_unix, no_data: true}
+        (plus `open`): it carries no worn_min, because 0 would claim the strap was off."""
         a, b = day_bounds(d)
         mins = self.day_mins(d)
-        row: dict = {"date": d.isoformat(), "start_unix": a, "worn_min": len(mins)}
+        row: dict = {"date": d.isoformat(), "start_unix": a}
         if not self.final(d):
             row["open"] = True
+        if not mins:
+            row["no_data"] = True
+            return row
+        row["worn_min"] = len(mins)
         # minutes with no worn data between the window's first and newest worn minute (strap off)
         lo = max(a, self.mins[0].t) if self.mins else b
         covered = max(0, min(b, self.now, (self.newest or a) + 60) - lo) // 60
@@ -236,11 +259,27 @@ class Window:
             if z:
                 row["zone_min"] = z
         sleep = self.day_sleep(d)
-        if sleep:
-            row["sleep"] = sleep_brief(max(sleep, key=lambda s: s.asleep_min))
-            if len(sleep) > 1:
-                row["sleep_sessions"] = len(sleep)
+        nights = [s for s in sleep if is_night(s)]
+        if nights:
+            row["sleep"] = sleep_brief(max(nights, key=lambda s: s.asleep_min))
+            if len(nights) > 1:
+                row["sleep_sessions"] = len(nights)
+        naps = sum(s.asleep_min for s in sleep if not is_night(s))
+        if naps:
+            row["nap_min"] = naps
         return row
+
+    def active_min(self, d: date) -> int | None:
+        """None for a day with no worn minute. Otherwise the duration_min (confirmed, else detected) of the
+        workouts starting this day, plus minutes at or above Z1 outside any detected workout window."""
+        mins = self.day_mins(d)
+        if not mins:
+            return None
+        wk = self.day_workouts(d)
+        thr = w.zone_low(WORKOUT_ZONE)
+        loose = sum(1 for m in mins if m.hr >= thr
+                    and not any(x["start_unix"] <= m.t < x["end_unix"] for x in wk))
+        return sum(x["duration_min"] for x in wk) + loose
 
 
 # The summary's workout table. Objects (day files, day view, workout view) also carry `confirmed` and
@@ -254,26 +293,30 @@ def table(records: list[dict], cols: list[str]) -> dict:
     return {"cols": cols, "rows": [[x[c] for c in cols] for x in records]}
 
 
-def trends(rows: list[dict]) -> dict:
-    """Latest value of a few metrics against the mean of the earlier days in the window."""
-    def active(r):    # minutes in Z1+; only complete days, a day still open is partial
-        return None if r.get("open") or not r["worn_min"] else sum(r.get("zone_min", {}).values())
+def trends(rows: list[dict], win: Window) -> dict:
+    """Latest value of a few metrics against the mean of the earlier days that have it. n counts those
+    earlier days; baseline and delta stay null (with `why`) until n >= MIN_BASELINE_N."""
+    def active(r):    # an open day is partial: it can be the latest, never part of the baseline
+        return None if r.get("open") and r is not rows[-1] else win.active_min(date.fromisoformat(r["date"]))
     metrics = {
-        "rest_hr": lambda r: r.get("rest_hr"),
-        "sleep_asleep_min": lambda r: r.get("sleep", {}).get("asleep_min"),
-        "sleep_eff_pct": lambda r: r.get("sleep", {}).get("eff_pct"),
-        "active_min": active,
+        "rest_hr": (lambda r: r.get("rest_hr"), "days"),
+        "sleep_asleep_min": (lambda r: r.get("sleep", {}).get("asleep_min"), "nights"),
+        "sleep_eff_pct": (lambda r: r.get("sleep", {}).get("eff_pct"), "nights"),
+        "active_min": (active, "days"),
     }
     out = {}
-    for k, get in metrics.items():
-        vals = [(r["date"], get(r)) for r in rows if get(r) is not None]   # latest = the last day that has it
+    for k, (get, unit) in metrics.items():
+        vals = [v for v in map(get, rows) if v is not None]     # latest = the last day that has it
         if not vals:
             continue
-        latest = vals[-1][1]
-        base = [v for _, v in vals[:-1]]
-        mean = round(st.mean(base), 1) if base else None
-        out[k] = {"latest": latest, "baseline": mean,
-                  "delta": None if mean is None else round(latest - mean, 1), "n": len(base)}
+        latest, base = vals[-1], vals[:-1]
+        t = {"latest": latest, "baseline": None, "delta": None, "n": len(base)}
+        if len(base) >= MIN_BASELINE_N:
+            mean = round(st.mean(base), 1)
+            t.update(baseline=mean, delta=round(latest - mean, 1))
+        else:
+            t["why"] = f"baseline needs {MIN_BASELINE_N} earlier {unit} with data, has {len(base)}"
+        out[k] = t
     return out
 
 
@@ -288,9 +331,14 @@ def freshness(win: Window) -> dict:
     demo = win.r.meta.get("address") == "-"
     sync = None if demo else w.last_sync_attempt()
     bat = None if demo else w.last_battery()
-    return {"data_age_min": None if win.newest is None else round((win.now - win.newest) / 60),
-            "last_sync": None if not sync else {k: sync.get(k) for k in ("outcome", "finished_unix")},
-            "battery_pct": None if not bat else bat["pct"]}
+    age = None if win.newest is None else round((win.now - win.newest) / 60)
+    out = {"data_age_min": age,
+           "last_sync": None if not sync else {k: sync.get(k) for k in ("outcome", "finished_unix")},
+           "battery_pct": None if not bat else bat["pct"]}
+    if sync and sync.get("outcome") == "not_advertising" and (age is None or age > STALE_MIN):
+        since = "no data yet" if age is None else f"no new data for {age // 60} h {age % 60} min"
+        out["hint"] = f"strap out of range of {socket.gethostname()} (not advertising); {since}"
+    return out
 
 
 def summary(win: Window, days: list[date], since: int | None = None) -> dict:
@@ -300,7 +348,7 @@ def summary(win: Window, days: list[date], since: int | None = None) -> dict:
     first = day_bounds(days[0])[0]
     workouts = [x for x in win.workouts if x["start_unix"] >= first]
     gaps = [g for g in win.gaps if g["end_unix"] > first]
-    trend = trends(rows)
+    trend = trends(rows, win)
     if since is not None:
         rows = [r for r in rows if day_bounds(date.fromisoformat(r["date"]))[1] > since]
         recent = {workouts[i]["start_unix"] for i, c in match_confirmations(workouts, win.confirmations).items()
@@ -336,7 +384,8 @@ def day_doc(win: Window, d: date) -> dict:
         "final": win.final(d), "generated_unix": win.now, "newest_sample_unix": win.newest,
         "summary": win.day_row(d),
         "workouts": win.day_workouts(d), "gaps": win.day_gaps(d),
-        "sleep": {"source": win.r.meta.get("sleep_source"), "sessions": [w.sleep_session(s) for s in win.day_sleep(d)]},
+        "sleep": {"source": win.r.meta.get("sleep_source"), "sessions": [{**w.sleep_session(s), "night": is_night(s)}
+                                                                for s in win.day_sleep(d)]},
         "labels": labels,
         "hr_per_minute": [[m.t, round(m.hr, 1)] for m in win.day_mins(d)],
     }
@@ -350,7 +399,7 @@ def day_view(win: Window, d: date) -> dict:
     return {
         "schema": DAY_VIEW_SCHEMA, "date": d.isoformat(), "tz": TZ_NAME, "final": win.final(d),
         "summary": win.day_row(d),
-        "sleep": [sleep_brief(s) for s in win.day_sleep(d)],
+        "sleep": [{**sleep_brief(s), "night": is_night(s)} for s in win.day_sleep(d)],
         "workouts": win.day_workouts(d), "gaps": win.day_gaps(d),
         "hourly": {"cols": ["start_unix", "local", "worn_min", "avg_hr", "max_hr"],
                    "rows": [[t, hm(t), len(v), round(st.mean(m.hr for m in v)), round(max(m.hr for m in v))]
@@ -394,7 +443,7 @@ def write_archive(win: Window, days: list[date], out_dir: Path, keep_days: int =
                 written.append(p)
             continue
         doc = day_doc(win, d)
-        if not doc["summary"]["worn_min"] and not doc["sleep"]["sessions"] and not old:
+        if doc["summary"].get("no_data") and not doc["sleep"]["sessions"] and not old:
             continue      # nothing recorded that day (before the strap's first data)
         if old and _comparable(old) == _comparable(doc):
             continue
