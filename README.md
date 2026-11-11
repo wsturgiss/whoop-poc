@@ -8,8 +8,10 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
 - **TUI** ([Textual](https://textual.textualize.io/)) shows latest, resting, range and worn-time HR, a per-minute HR sparkline, a sleep table with stage totals and a colored stage bar. It reloads automatically. `s` starts a background sync (the systemd unit if installed), and an animated banner shows its progress; `q` quits right away, even mid-drain, because drains resume safely.
 - **HTML** is a single static page with an HR chart, shaded sleep windows, a stage hypnogram per session and a sleep table, with light and dark themes.
 - **summary** is a plain-text printout.
-- **json** / **serve** emit a versioned JSON snapshot (latest HR, per-minute HR, sleep sessions + stages,
-  sync freshness) for other programs. The contract is in [COACH.md](COACH.md).
+- **coach** prints a compact summary for an LLM assistant (per-day rows, detected workouts, gaps,
+  freshness, trends; ≤ ~3 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
+  `coach workout <start>`. **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
+  with per-minute HR; `json --raw` and **serve** also give the per-minute snapshot. The contract is in [COACH.md](COACH.md).
 
 ## Install (per user, no root)
 
@@ -23,7 +25,9 @@ See [PLUGIN.md](PLUGIN.md) for what goes where and the plan for an Omarchy bar w
 
 `whoop-sync.timer` runs `whoop-sync sync` 15 min after the previous attempt finished. Each attempt
 drains for up to `WHOOP_SYNC_MAX` seconds (default 1200), which is below the unit's
-`TimeoutStartSec=30min` so systemd never kills a drain mid-flight. Then `coach.json` is refreshed.
+`TimeoutStartSec=30min` so systemd never kills a drain mid-flight. Then `coach.json` and
+`daily/YYYY-MM-DD.json` are refreshed (window `WHOOP_COACH_DAYS`, default 7; archive kept
+`WHOOP_ARCHIVE_DAYS`, default 30; see [COACH.md](COACH.md)).
 
 **Resume:** NOOP commits each chunk (fsync) *before* acking it, and the strap only trims acked chunks. So a drain
 that stops early (time cap, SIGTERM, BLE drop, strap out of range) loses nothing. The next run continues
@@ -64,8 +68,10 @@ uv run whoop-poc html         # writes out/whoop.html → open it in a browser
 uv run whoop-poc html --watch # regenerate every 30s (page auto-refreshes)
 uv run whoop-poc summary      # plain text
 uv run whoop-poc --demo       # synthetic night pinned to 2020-01-01, to preview the sleep view
-uv run whoop-poc json         # snapshot JSON to stdout (--out FILE writes atomically, mode 600)
-uv run whoop-poc serve        # GET http://127.0.0.1:8787/v1/snapshot?hours=24
+uv run whoop-poc coach        # Coach summary, compact JSON (since <unix> | day <date> | workout <start>)
+uv run whoop-poc json         # the same summary, indented (--out FILE also writes daily/ next to FILE;
+                              #   atomic, mode 600; --raw = per-minute snapshot@1 over --hours)
+uv run whoop-poc serve        # GET http://127.0.0.1:8787/v1/coach[?since=UNIX], /v1/snapshot?hours=24
 ```
 
 Options: `--db PATH` (default `~/src/noop/tools/linux-capture/captures/whoop.db`, or env `WHOOP_DB`),

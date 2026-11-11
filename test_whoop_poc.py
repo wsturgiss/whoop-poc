@@ -287,3 +287,138 @@ class HRChart(unittest.TestCase):
             self.assertIn(day, labels)
         for m in __import__("re").finditer(r"\S+", labels):
             self.assertEqual(ticks[m.start()], "╵")
+
+
+class Coach(unittest.TestCase):
+    """coach.py: the LLM-facing summary (snapshot@2), drill-downs and the daily archive. Synthetic data."""
+
+    @staticmethod
+    def ts(*a):
+        import coach
+        from datetime import datetime
+        return int(datetime(*a, tzinfo=coach.TZ).timestamp())
+
+    def week(self, now):
+        """7 local days + lead: asleep 00:00-07:00 at 55 bpm, a 40-min run at 150 bpm at 18:00, else 75."""
+        import coach
+        days = coach.window_days(coach.local_date(now), 7)
+        since = coach.day_bounds(days[0])[0] - coach.SLEEP_LEAD_S
+        mins, sleep = [], []
+        for t in range(since, now, 60):
+            h = coach.datetime.fromtimestamp(t, coach.TZ).hour
+            m = coach.datetime.fromtimestamp(t, coach.TZ).minute
+            asleep = h < 7
+            hr = 55 if asleep else 150 if h == 18 and m < 40 else 75
+            mins.append(w.Minute(t, float(hr), 0.01 if asleep else 0.2, 60, asleep))
+        for d in days:
+            a = coach.day_bounds(d)[0]
+            if a + 7 * 3600 <= now:
+                sleep.append(w.SleepWindow(a, a + 7 * 3600, [m for m in mins if a <= m.t < a + 7 * 3600]))
+        meta = {"address": "AA:BB", "name": "test", "newest_unix": now - 60, "labels": [], "sleep_source": "heuristic"}
+        r = w.Report(meta, since, now, [w.Sample(now - 60, 75, 0.1, -0.4, 0.91)], mins, sleep)
+        return coach.Window(r, now), days
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        p = mock.patch.object(w, "STATE_DIR", self.dir)      # no real sync.json / battery.json
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_workouts_merge_short_dips_and_drop_short_runs(self):
+        import coach
+        hr = [70] * 5 + [150] * 6 + [100] * 2 + [150] * 6 + [70] * 10 + [150] * 9 + [70] * 5
+        hr += [150] * 6 + [100] * 3 + [150] * 6 + [70] * 3       # a 3-min dip splits: two 6-min runs, both too short
+        mins = [w.Minute(i * 60, float(b), 0.2, 60) for i, b in enumerate(hr)]
+        found = coach.detect_workouts(mins)
+        self.assertEqual([(x["start_unix"] // 60, x["duration_min"]) for x in found], [(5, 14)])
+        self.assertEqual((found[0]["max_hr"], found[0]["zone_min"]), (150, {"Z2": 12}))
+
+    def test_gaps_and_dst_day(self):
+        import coach
+        from datetime import date
+        mins = [w.Minute(t, 70.0, 0.1, 60) for t in list(range(0, 600, 60)) + list(range(600 + 45 * 60, 6000, 60))]
+        self.assertEqual([g["min"] for g in coach.detect_gaps(mins)], [45])
+        if coach.TZ_NAME == "America/New_York":
+            a, b = coach.day_bounds(date(2026, 11, 1))           # DST ends: a 25-hour day
+            self.assertEqual(b - a, 25 * 3600)
+
+    def test_summary_is_small_and_has_no_per_minute_arrays(self):
+        import coach, json
+        now = self.ts(2026, 11, 11, 20, 0)
+        win, days = self.week(now)
+        doc = coach.summary(win, days)
+        raw = json.dumps(doc, separators=(",", ":"))
+        self.assertLess(len(raw), 3000, len(raw))
+        self.assertEqual(doc["schema"], "whoop-poc/snapshot@2")
+        self.assertEqual(len(doc["days"]), 7)
+        self.assertEqual(len(doc["workouts"]["rows"]), 7)
+        self.assertNotIn("per_minute", raw)
+        today = doc["days"][-1]
+        self.assertTrue(today["open"])
+        self.assertEqual((today["sleep"]["asleep_min"], today["zone_min"]), (420, {"Z2": 40}))
+        x = dict(zip(doc["workouts"]["cols"], doc["workouts"]["rows"][-1]))
+        self.assertEqual((x["local"], x["duration_min"], x["avg_hr"]), ("11-11 18:00-18:40", 40, 150))
+        self.assertEqual(doc["trends"]["rest_hr"]["delta"], 0)
+        self.assertEqual(doc["cursor_unix"], now - 60)
+
+    def test_since_keeps_only_newer_records(self):
+        import coach
+        now = self.ts(2026, 11, 11, 20, 0)
+        win, days = self.week(now)
+        doc = coach.summary(win, days, since=self.ts(2026, 11, 11, 12, 0))
+        self.assertEqual([r["date"] for r in doc["days"]], ["2026-11-11"])
+        self.assertEqual(len(doc["workouts"]["rows"]), 1)
+        self.assertIn("baseline", doc["trends"]["rest_hr"])      # trends still use the full window
+
+    def test_workout_drill_down(self):
+        import coach
+        now = self.ts(2026, 11, 11, 20, 0)
+        win, _ = self.week(now)
+        doc = coach.workout_view(win, self.ts(2026, 11, 11, 18, 10))
+        self.assertEqual(doc["schema"], "whoop-poc/workout@1")
+        self.assertEqual(len(doc["hr_per_minute"]), 40)
+        self.assertIsNone(coach.workout_view(win, self.ts(2026, 11, 11, 13, 0)))
+
+    def test_archive_writes_final_once_and_prunes(self):
+        import coach, json, os
+        now = self.ts(2026, 11, 11, 20, 0)
+        win, days = self.week(now)
+        out = self.dir / "daily"
+        out.mkdir()
+        (out / "2026-10-01.json").write_text("{}")             # older than 30 days
+        (out / "2026-10-20.json").write_text("{}")
+        written = coach.write_archive(win, days, out)
+        self.assertEqual(len(written), 7)
+        self.assertFalse((out / "2026-10-01.json").exists())
+        self.assertTrue((out / "2026-10-20.json").exists())
+        y = json.loads((out / "2026-11-10.json").read_text())
+        self.assertEqual((y["schema"], y["final"]), ("whoop-poc/day@1", True))
+        self.assertEqual(len(y["hr_per_minute"]), 1440)
+        self.assertEqual(os.stat(out / "2026-11-10.json").st_mode & 0o777, 0o600)
+        self.assertTrue(all(t > y["start_unix"] for t, _ in y["hr_per_minute"][1:]))
+        # second run: final days untouched, unchanged open day not rewritten; later data rewrites today only
+        self.assertEqual(coach.write_archive(win, days, out), [])
+        win2, days2 = self.week(now + 600)
+        self.assertEqual([p.name for p in coach.write_archive(win2, days2, out)], ["2026-11-11.json"])
+
+    def test_cli_json_out_and_raw(self):
+        import io, json
+        from contextlib import redirect_stdout
+        out = self.dir / "coach.json"
+        w.main(["json", "--demo", "--heuristic", "--out", str(out)])
+        doc = json.loads(out.read_text())
+        self.assertEqual(doc["schema"], "whoop-poc/snapshot@2")
+        self.assertTrue(doc["demo"])
+        self.assertFalse((self.dir / "daily").exists())        # demo data is never archived
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            w.main(["json", "--raw", "--demo", "--heuristic"])
+        self.assertEqual(json.loads(buf.getvalue())["schema"], "whoop-poc/snapshot@1")
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            w.main(["coach", "bogus", "--demo", "--heuristic"])
+        self.assertEqual(cm.exception.code, 2)

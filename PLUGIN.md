@@ -16,7 +16,7 @@ in two layers.
 | `whoop-sync` wrapper | `~/.local/bin/whoop-sync` → `contrib/whoop-sync` | this repo |
 | sync service + timer | `~/.config/systemd/user/whoop-sync.{service,timer}` | `contrib/systemd/` |
 | strap config | `~/.config/whoop-poc/env` (`WHOOP_ADDRESS=…`, mode 600) | written once, never in git |
-| snapshot / sync status | `~/.local/state/whoop-poc/{coach.json,sync.json,last-sync.log}` | written by the service |
+| summary / archive / sync status | `~/.local/state/whoop-poc/{coach.json,daily/,sync.json,last-sync.log}` | written by the service |
 
 External prerequisites, not vendored: a NOOP checkout with `tools/linux-capture` (its venv),
 `whoop-decode` built, and optionally `stager/` built for 4-stage sleep (see README). The strap is paired
@@ -30,8 +30,8 @@ published as one. `plugin add` expects the manifest at the repo root.
 ```
 manifest.json        kinds: ["bar-widget"], entryPoints.barWidget: "Widget.qml"
 Widget.qml           reads ~/.local/state/whoop-poc/coach.json every N s
-                     bar text:  ♥ 63 · 7h12m   (latest bpm · last night asleep)
-                     dims / shows ⚠ when freshness.data_age_min > 60 or last outcome != complete
+                     bar text:  ♥ 63 · 7h12m   (latest_hr.bpm · days[-1].sleep.asleep_min)
+                     dims / shows ⚠ when freshness.data_age_min > 60 or last_sync.outcome != complete
                      click → launch `whoop-poc` (TUI) in a floating terminal
 Preferences.qml      refresh interval, show sleep, staleness threshold
 ```

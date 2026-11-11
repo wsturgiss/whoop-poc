@@ -7,7 +7,8 @@ decodes WHOOP 4.0 type-47 HISTORICAL_DATA records (v12/v24 layout), and shows:
   * heart rate: latest, per-minute trend, min/avg/max, approximate resting HR
   * sleep: windows detected by a simple motion + HR heuristic (NOT WHOOP's sleep staging)
 
-Subcommands:  tui (default) | summary | html | json (Coach snapshot) | serve (localhost JSON)
+Subcommands:  tui (default) | summary | html | coach (Coach summary + drill-downs, coach.py) |
+              json (writes coach.json + daily archive; --raw = per-minute snapshot@1) | serve (localhost JSON)
 Core + HTML are stdlib only; the TUI (tui.py) uses Textual. Does no BLE itself; `--sync` shells out to `whoop-sync` / linux-capture's whoop_sync.py.
 """
 from __future__ import annotations
@@ -227,14 +228,18 @@ class Report:
         return [m for m in self.minutes if m.hr and m.n >= 5]
 
     def hr_stats(self) -> dict | None:
-        hm = self.hr_minutes
-        if not hm:
-            return None
-        vals = [m.hr for m in hm]
-        still = sorted(m.hr for m in hm if m.motion < STILL_MOTION) or sorted(vals)
-        return {"min": min(vals), "avg": st.mean(vals), "max": max(vals),
-                "rest": still[max(0, len(still) // 20)],   # ~5th pct of still minutes
-                "worn_min": len(hm)}
+        return minute_stats(self.hr_minutes)
+
+
+def minute_stats(hm: list[Minute]) -> dict | None:
+    """min/avg/max/resting HR over worn minutes (Report.hr_minutes or a slice of it); None if empty."""
+    if not hm:
+        return None
+    vals = [m.hr for m in hm]
+    still = sorted(m.hr for m in hm if m.motion < STILL_MOTION) or sorted(vals)
+    return {"min": min(vals), "avg": st.mean(vals), "max": max(vals),
+            "rest": still[max(0, len(still) // 20)],   # ~5th pct of still minutes
+            "worn_min": len(hm)}
 
 
 def demo_samples(end: int) -> list[Sample]:
@@ -714,23 +719,26 @@ def last_battery() -> dict | None:
         return None
 
 
+def sleep_session(s: SleepWindow) -> dict:
+    """One sleep session as it appears in snapshot@1 and the daily archive (COACH.md)."""
+    hrs = s.hrs
+    return {
+        "start_unix": s.start, "end_unix": s.end, "start_iso": _iso(s.start), "end_iso": _iso(s.end),
+        "in_bed_min": s.span_min, "asleep_min": s.asleep_min,
+        "stage_min": s.stage_minutes() if s.stages is not None else None,
+        "avg_hr": round(st.mean(hrs), 1) if hrs else None,
+        "resting_hr": s.resting_hr, "avg_hrv_ms": round(s.avg_hrv, 1) if s.avg_hrv else None,
+        "stages": [{"start_unix": g["start"], "end_unix": g["end"], "stage": g["stage"]}
+                   for g in s.stages] if s.stages is not None else None,
+    }
+
+
 def snapshot(r: Report, now: int | None = None) -> dict:
     """Stable JSON document for other programs (e.g. Coach). Schema documented in COACH.md."""
     now = now or int(time.time())
     hr_now, stats = r.hr_now, r.hr_stats()
     newest = r.samples[-1].unix if r.samples else None
-    sessions = []
-    for s in r.sleep:
-        hrs = s.hrs
-        sessions.append({
-            "start_unix": s.start, "end_unix": s.end, "start_iso": _iso(s.start), "end_iso": _iso(s.end),
-            "in_bed_min": s.span_min, "asleep_min": s.asleep_min,
-            "stage_min": s.stage_minutes() if s.stages is not None else None,
-            "avg_hr": round(st.mean(hrs), 1) if hrs else None,
-            "resting_hr": s.resting_hr, "avg_hrv_ms": round(s.avg_hrv, 1) if s.avg_hrv else None,
-            "stages": [{"start_unix": g["start"], "end_unix": g["end"], "stage": g["stage"]}
-                       for g in s.stages] if s.stages is not None else None,
-        })
+    sessions = [sleep_session(s) for s in r.sleep]
     return {
         "schema": SNAPSHOT_SCHEMA,
         "demo": r.meta.get("address") == "-",
@@ -1011,20 +1019,22 @@ def drain_status() -> dict | None:
     return out
 
 
-def write_json(path: Path, doc: dict) -> None:
-    """Atomic, owner-only write (biometric data)."""
+def write_json(path: Path, doc: dict, compact: bool = False) -> None:
+    """Atomic, owner-only write (biometric data). compact = no whitespace (Coach summary, daily archive)."""
     import json
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump(doc, f, indent=1)
+        json.dump(doc, f, separators=(",", ":")) if compact else json.dump(doc, f, indent=1)
         f.write("\n")
     os.replace(tmp, path)
 
 
 def run_serve(args) -> None:
-    """Tiny localhost-only JSON endpoint: GET /v1/snapshot[?hours=N], GET /healthz."""
+    """Tiny localhost-only JSON endpoint: GET /v1/coach[?since=UNIX] (snapshot@2), GET /v1/snapshot[?hours=N]
+    (per-minute snapshot@1), GET /healthz."""
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
@@ -1034,6 +1044,14 @@ def run_serve(args) -> None:
             u = urlparse(self.path)
             if u.path == "/healthz":
                 code, doc = 200, {"ok": True}
+            elif u.path == "/v1/coach":
+                import coach
+                try:
+                    q = parse_qs(u.query)
+                    doc, code = coach.run(args, ["since", q["since"][0]] if "since" in q else [])
+                    code = 200 if code == 0 else 400
+                except (ValueError, SystemExit) as e:
+                    code, doc = 400, {"error": str(e)}
             elif u.path == "/v1/snapshot":
                 try:
                     hours = float(parse_qs(u.query).get("hours", [args.hours])[0])
@@ -1042,8 +1060,8 @@ def run_serve(args) -> None:
                 except (ValueError, SystemExit) as e:
                     code, doc = 400, {"error": str(e)}
             else:
-                code, doc = 404, {"error": "try /v1/snapshot"}
-            body = json.dumps(doc).encode()
+                code, doc = 404, {"error": "try /v1/coach or /v1/snapshot"}
+            body = json.dumps(doc, separators=(",", ":")).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1054,7 +1072,7 @@ def run_serve(args) -> None:
             pass
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), H)
-    print(f"serving http://127.0.0.1:{args.port}/v1/snapshot", flush=True)
+    print(f"serving http://127.0.0.1:{args.port}/v1/coach and /v1/snapshot", flush=True)
     srv.serve_forever()
 
 
@@ -1100,19 +1118,26 @@ def start_sync_background() -> tuple[bool, str]:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="whoop-poc", description=__doc__.splitlines()[0])
-    p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "json", "serve"])
+    p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "coach", "json", "serve"])
+    p.add_argument("rest", nargs="*", help="coach: since <unix> | day <YYYY-MM-DD> | workout <start>")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"NOOP whoop.db (default {DEFAULT_DB}; env WHOOP_DB)")
     p.add_argument("--address", help="strap MAC if the DB holds several devices")
-    p.add_argument("--hours", type=float, default=24, help="look-back window (default 24)")
+    p.add_argument("--hours", type=float, default=24, help="look-back window (default 24; json --raw, summary, html, tui)")
+    p.add_argument("--days", type=int, default=int(os.environ.get("WHOOP_COACH_DAYS", 7)),
+                   help="coach / json: summary window in local calendar days incl. today (default WHOOP_COACH_DAYS or 7)")
+    p.add_argument("--raw", action="store_true", help="json: the per-minute snapshot@1 over --hours instead of the summary")
+    p.add_argument("--no-archive", action="store_true", help="json --out: don't write the daily/ archive")
     p.add_argument("--sync", action="store_true", help="drain new history from the strap first")
     p.add_argument("--refresh", type=int, default=30, help="TUI reload / html --watch interval, seconds")
     p.add_argument("--out", default=None, help="html: output path (default out/whoop.html); json: write here "
-                   "atomically instead of stdout")
+                   "atomically instead of stdout, and refresh the daily/ archive next to it")
     p.add_argument("--port", type=int, default=8787, help="serve: localhost port (default 8787)")
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
     p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")
     a = p.parse_args(argv)
+    if a.rest and a.cmd != "coach":
+        p.error(f"unexpected arguments: {' '.join(a.rest)}")
     a.db = a.db.expanduser()
     if not a.demo and not a.db.exists():
         raise SystemExit(f"db not found: {a.db}  (run a NOOP linux-capture sync first, or pass --db)")
@@ -1125,13 +1150,26 @@ def main(argv=None) -> None:
         width = shutil.get_terminal_size((88, 24)).columns
         for _, line in text_lines(build_report(a.db, a.hours, a.address, demo=a.demo, heuristic=a.heuristic), width):
             print(line)
-    elif a.cmd == "json":
+    elif a.cmd == "coach":
+        import json
+        import coach
+        doc, code = coach.run(a, a.rest)
+        print(json.dumps(doc, separators=(",", ":")))
+        raise SystemExit(code)
+    elif a.cmd == "json" and a.raw:
         import json
         doc = snapshot(build_report(a.db, a.hours, a.address, demo=a.demo, heuristic=a.heuristic))
         if a.out:
             write_json(Path(a.out).expanduser(), doc)
         else:
             print(json.dumps(doc, indent=1))
+    elif a.cmd == "json":
+        import json
+        import coach
+        if a.out:
+            coach.write_snapshot(a, Path(a.out).expanduser(), archive=not a.no_archive)
+        else:
+            print(json.dumps(coach.run(a, [])[0], indent=1))
     elif a.cmd == "serve":
         run_serve(a)
     else:
