@@ -27,7 +27,9 @@ See [PLUGIN.md](PLUGIN.md) for what goes where and the plan for an Omarchy bar w
 drains for up to `WHOOP_SYNC_MAX` seconds (default 1200), which is below the unit's
 `TimeoutStartSec=30min` so systemd never kills a drain mid-flight. Then `coach.json` and
 `daily/YYYY-MM-DD.json` are refreshed (window `WHOOP_COACH_DAYS`, default 7; archive kept
-`WHOOP_ARCHIVE_DAYS`, default 30; see [COACH.md](COACH.md)).
+`WHOOP_ARCHIVE_DAYS`, default 30; see [COACH.md](COACH.md)). Last, `whoop-poc webhook` POSTs newly
+detected likely workouts to Coach when `WHOOP_COACH_WEBHOOK_URL` and `WHOOP_COACH_WEBHOOK_AUTH` are set in
+`~/.config/whoop-poc/env` (`whoop-poc webhook --test` sends a sample; see COACH.md, "Workout webhook").
 
 **Resume:** NOOP commits each chunk (fsync) *before* acking it, and the strap only trims acked chunks. So a drain
 that stops early (time cap, SIGTERM, BLE drop, strap out of range) loses nothing. The next run continues

@@ -16,7 +16,8 @@ time. Never scrape the TUI or HTML.
 | Per-minute snapshot (`whoop-poc/snapshot@1`) | `whoop-poc json --raw [--hours 24]`, `GET /v1/snapshot?hours=24` | ~45 KB per day |
 
 `whoop-sync.service` refreshes `coach.json` and the archive after every sync attempt (`ExecStopPost`
-runs `whoop-poc json --out coach.json`), roughly every 15–35 min. Files are written atomically
+runs `whoop-poc json --out coach.json`, then `whoop-poc webhook`; see "Workout webhook"), roughly every
+15–35 min. Files are written atomically
 (tmp + rename), mode 600, in a 700 directory. It is biometric data: it lives outside the repo and is
 never committed. All CLI drill-downs print one line of compact JSON to stdout.
 
@@ -338,6 +339,8 @@ In `~/.config/whoop-poc/env` (or the environment):
 | `WHOOP_TZ` | `America/New_York` | time zone for day boundaries and `local` strings |
 | `WHOOP_MAX_HR` | unset | max HR override (`--max-hr` beats it); unset = observed peak if above 190, else 190 (see "Max HR") |
 | `WHOOP_RESTING_HR` | 60 | resting HR for the heart-rate reserve |
+| `WHOOP_COACH_WEBHOOK_URL` | unset | workout webhook endpoint (https, or http to localhost); unset = no webhook |
+| `WHOOP_COACH_WEBHOOK_AUTH` | unset | the full `Authorization` header value sent with it; unset = no webhook |
 
 ## Reading it well
 
@@ -353,7 +356,35 @@ In `~/.config/whoop-poc/env` (or the environment):
 - HR is per-second strap history averaged per minute. It's not live: the newest value is as old as the
   last sync.
 
+## Workout webhook
+
+After each sync attempt, `whoop-sync.service` runs `whoop-poc webhook`, which POSTs each newly detected
+likely workout to `WHOOP_COACH_WEBHOOK_URL` with `Authorization: $WHOOP_COACH_WEBHOOK_AUTH`, one request per
+workout:
+
+```jsonc
+{"id": "2026-11-13-0733", "start_unix": …, "end_unix": …,
+ "minutes": 10,                 // duration_min: confirmed minutes if confirmed, else detected
+ "avg_hr": 140, "max_hr": 156,  // 1-minute means, as in the summary
+ "needs_confirm": true, "zone_min": {"Z1": 3, "Z2": 6, "Z3": 1}}
+ // + "kind" ("run" | "lift" | "bike") once a workout carries one; none do yet
+```
+
+- Likely workout = `needs_confirm: true`. It is posted once the data runs at least 3 min (the merge gap)
+  past its end, so a sync during a workout doesn't post a partial one.
+- `~/.local/state/whoop-poc/webhook-sent.json` records handled ids. The first run records the workouts
+  detected then as `seeded` and posts none. An id goes into `sent` only after a 2xx response; anything
+  else (including a redirect, which is never followed) is retried on the next sync. Ids older than
+  `WHOOP_ARCHIVE_DAYS` are dropped from the file.
+- With either variable unset it does nothing and exits 0. Output lists only workout ids and HTTP status
+  codes, never the URL or the header value.
+- `whoop-poc webhook --test` sends one sample body with `"test": true` and an id starting `test-`, prints
+  the status and whether the response body looks like success, and doesn't touch the state file.
+- An id is the workout's detected start. A change that moves a start (e.g. a new `max_hr` changing the
+  zone threshold) makes it a new id, which is posted again.
+
 ## Not (yet) here
 
-Recovery/strain scores, SpO₂, skin temperature (unmapped in NOOP's Linux path), and a push/subscribe
-channel. Poll instead: `coach.json`'s mtime changes after every sync attempt.
+Recovery/strain scores, SpO₂, skin temperature (unmapped in NOOP's Linux path), and a subscribe
+channel for anything but workouts (see "Workout webhook"). Poll instead: `coach.json`'s mtime changes after
+every sync attempt.

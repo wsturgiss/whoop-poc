@@ -1181,7 +1181,7 @@ def start_sync_background() -> tuple[bool, str]:
 
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="whoop-poc", description=__doc__.splitlines()[0])
-    p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "coach", "json", "serve"])
+    p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "coach", "json", "serve", "webhook"])
     p.add_argument("rest", nargs="*", help="coach: since <unix> | day <YYYY-MM-DD> | workout <id> | confirm <id> | maxhr")
     p.add_argument("--minutes", type=int, help="coach confirm: the wearer's duration for the workout, minutes")
     p.add_argument("--start", help="coach confirm: the wearer's start time, HH:MM on the workout's day (optional)")
@@ -1204,6 +1204,7 @@ def main(argv=None) -> None:
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
     p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")
+    p.add_argument("--test", action="store_true", help="webhook: post one sample payload marked test: true")
     p.add_argument("--max-hr", type=int, help="max HR for zones, bpm: overrides WHOOP_MAX_HR and the observed peak")
     a = p.parse_args(argv)
     if a.max_hr is not None:            # child processes (the TUI's report worker) inherit it
@@ -1229,6 +1230,9 @@ def main(argv=None) -> None:
         doc, code = coach.run(a, a.rest)
         print(json.dumps(doc, separators=(",", ":")))
         raise SystemExit(code)
+    elif a.cmd == "webhook":
+        import webhook
+        raise SystemExit(webhook.run(a))
     elif a.cmd == "json" and a.raw:
         import json
         doc = snapshot(build_report(a.db, a.hours, a.address, demo=a.demo, heuristic=a.heuristic))

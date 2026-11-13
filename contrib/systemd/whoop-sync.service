@@ -10,6 +10,8 @@ Type=oneshot
 ExecStart=%h/.local/bin/whoop-sync sync
 # Refresh the Coach-readable snapshot after every attempt, even when the drain failed (- = ignore errors).
 ExecStopPost=-%h/.local/bin/whoop-poc json --out %S/whoop-poc/coach.json
+# Then POST newly detected likely workouts to Coach (no-op unless WHOOP_COACH_WEBHOOK_URL and _AUTH are set).
+ExecStopPost=-%h/.local/bin/whoop-poc webhook
 TimeoutStartSec=30min
 TimeoutStopSec=3min
 Nice=10
