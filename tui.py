@@ -52,6 +52,8 @@ class WhoopApp(App):
     #hr-axis, #sleep-note, #hypno-legend { color: $text-muted; height: auto; }
     #hypno { color: $accent; height: auto; margin-top: 1; }
     DataTable { height: auto; max-height: 8; }
+    /* ANSI themes: the header uses the terminal's own fg/bg pair, so it reads in any palette */
+    DataTable:ansi > .datatable--header { background: ansi_default; color: ansi_default; text-style: bold underline; }
     """
     BINDINGS = [("q", "quit", "Quit"), ("r", "reload", "Reload"), ("s", "sync", "Sync strap now"),
                 ("w", "window", "Window 24h/3d/7d"), ("l", "live", "Live HR on/off"),
