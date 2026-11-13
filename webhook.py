@@ -166,7 +166,7 @@ def run(a, send=post, log=print) -> int:
     if getattr(a, "test", False):
         status, body = send(url, auth, test_payload(int(time.time())))
         log(f"webhook: test -> {status if status is not None else 'no response'}"
-            + (f", body looks like success: {'yes' if body_looks_ok(body) else 'no'}" if status is not None else ""))
+            + (f", body looks like success: {'yes' if body_looks_ok(body) else 'no'}" if ok(status) else ""))
         return 0 if ok(status) else 1
     if a.demo:
         log("webhook: not with --demo")

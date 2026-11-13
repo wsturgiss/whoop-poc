@@ -112,7 +112,8 @@ class Webhook(unittest.TestCase):
     def test_output_never_carries_url_or_auth(self):
         sender = Sender(401)
         with mock.patch.dict(os.environ, ENV):
-            webhook.run(SimpleNamespace(test=True, demo=False), sender, self.logs.append)
+            self.assertEqual(webhook.run(SimpleNamespace(test=True, demo=False), sender, self.logs.append), 1)
+        self.assertEqual(self.logs, ["webhook: test -> 401"])            # no body verdict on a failure
         self.send_new(window(hr_trace((600, 80), t0=T0 - 600)), sender)
         self.send_new(window(two_runs()), sender)
         text = "\n".join(self.logs)
