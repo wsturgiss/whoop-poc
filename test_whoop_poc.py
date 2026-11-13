@@ -229,6 +229,14 @@ class WindowLabel(unittest.TestCase):
         nap = w.window_label(ts(2026, 11, 7, 13, 0), ts(2026, 11, 7, 14, 30), ts(2026, 11, 7, 18, 0))
         self.assertEqual(nap, "Sat Nov 07 13:00 → 14:30 · ended today")
 
+    def test_sleep_hours(self):
+        st = [{"start": 0, "end": 3600, "stage": "light"}, {"start": 3600, "end": 3900, "stage": "wake"}]
+        staged = w.SleepWindow(0, 3900, [], stages=st)
+        self.assertEqual(w.sleep_hours(staged), "1h 00m asleep · 1h 05m in bed")
+        mins = [w.Minute(i * 60, 55.0, 0.0, 60, i < 45) for i in range(65)]
+        heur = w.SleepWindow(0, 3900, mins)
+        self.assertEqual(w.sleep_hours(heur), "≈0h 45m asleep (heuristic) · 1h 05m in bed")
+
 
 class HourAxis(unittest.TestCase):
     def test_ticks_align_and_thin_out(self):

@@ -459,6 +459,14 @@ def dur(mins: int) -> str:
     return f"{mins // 60}h {mins % 60:02d}m"
 
 
+def sleep_hours(s: SleepWindow) -> str:
+    """'7h 56m asleep · 9h 39m in bed'; asleep is prefixed ≈ and marked when it comes from the
+    motion + HR heuristic rather than stager stages."""
+    if s.stages is not None:
+        return f"{dur(s.asleep_min)} asleep · {dur(s.span_min)} in bed"
+    return f"≈{dur(s.asleep_min)} asleep (heuristic) · {dur(s.span_min)} in bed"
+
+
 def ago(t: int) -> str:
     s = max(0, int(time.time()) - t)
     if s < 120:

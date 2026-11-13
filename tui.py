@@ -393,7 +393,8 @@ class WhoopApp(App):
         ticks, labels = core.hour_axis(last.start, last.end, width, ends=True)
         if width >= 12:                     # exact start/end bold, hour markers dim
             labels = f"[b]{labels[:5]}[/][dim]{labels[5:-5]}[/][b]{labels[-5:]}[/]"
-        hyp.update(f"latest window  {core.window_label(last.start, last.end)}\n{bar}\n[dim]{ticks}[/]\n{labels}")
+        hyp.update(f"[b]Last sleep[/]  {core.window_label(last.start, last.end)}\n"
+                   f"{core.sleep_hours(last)}\n{bar}\n[dim]{ticks}[/]\n{labels}")
         legend.update(legend_txt)
 
 
