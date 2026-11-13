@@ -1,9 +1,13 @@
 """Textual TUI for whoop-poc: heart rate + approximate sleep from a local NOOP whoop.db."""
 from __future__ import annotations
 
+import json
+import os
 import statistics as st
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -15,6 +19,30 @@ import whoop_poc as core
 class Tile(Static):
     def show(self, label: str, value: str, note: str = "") -> None:
         self.update(f"[dim]{label}[/]\n[b]{value}[/]\n[dim]{note}[/]")
+
+
+SETTINGS_PATH = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "whoop-poc" / "tui.json"
+WINDOW_STEPS = (24, 72, 168)            # hours the w key cycles through
+
+
+def load_settings(path: Path = SETTINGS_PATH) -> dict:
+    """TUI settings saved by save_settings ({"theme": str, "hours": int}); {} if missing or invalid."""
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def save_settings(d: dict, path: Path = SETTINGS_PATH) -> None:
+    """Write settings atomically; a failed write leaves the old file and is otherwise ignored."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=2) + "\n")
+        tmp.replace(path)
+    except OSError:
+        pass
 
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -75,6 +103,17 @@ class WhoopApp(App):
         self._report: core.Report | None = None
         self._building = self._rebuild = False
         self._exiting = False
+        self._settings = load_settings()
+        hours = self._settings.get("hours")
+        if not getattr(args, "hours_explicit", False) and hours in WINDOW_STEPS:
+            self.args.hours = hours
+
+    def save_setting(self, key: str, value) -> None:
+        self._settings[key] = value
+        save_settings(self._settings)
+
+    def save_theme(self, theme) -> None:
+        self.save_setting("theme", theme.name)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -101,6 +140,9 @@ class WhoopApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        if self._settings.get("theme") in self.available_themes:
+            self.theme = self._settings["theme"]
+        self.theme_changed_signal.subscribe(self, self.save_theme)
         self._drain = None if self.args.demo else core.drain_status()
         self.action_reload()
         self.set_interval(self.args.refresh, self.action_reload)
@@ -306,8 +348,8 @@ class WhoopApp(App):
         self.poll_drain()
 
     def action_window(self) -> None:
-        steps = (24, 72, 168)
-        self.args.hours = next((h for h in steps if h > self.args.hours), steps[0])
+        self.args.hours = next((h for h in WINDOW_STEPS if h > self.args.hours), WINDOW_STEPS[0])
+        self.save_setting("hours", self.args.hours)
         self.notify(f"Window: last {core.dur(int(self.args.hours * 60)).replace(' 00m', '')}")
         self.action_reload()
 
@@ -415,6 +457,7 @@ def make_report_pool():
 
 
 def run_tui(args) -> None:
+    args.hours_explicit = any(a == "--hours" or a.startswith("--hours=") for a in sys.argv[1:])
     pool = make_report_pool()
     try:
         WhoopApp(args, pool).run()

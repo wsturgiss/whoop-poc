@@ -604,3 +604,19 @@ class Coach(unittest.TestCase):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm:
             w.main(["coach", "bogus", "--demo", "--heuristic"])
         self.assertEqual(cm.exception.code, 2)
+
+
+class TuiSettings(unittest.TestCase):
+    def test_round_trip_and_bad_files(self):
+        import tempfile
+        from pathlib import Path
+        import tui
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "whoop-poc" / "tui.json"
+            self.assertEqual(tui.load_settings(p), {})                  # missing
+            tui.save_settings({"theme": "ansi-dark", "hours": 72}, p)
+            self.assertEqual(tui.load_settings(p), {"theme": "ansi-dark", "hours": 72})
+            p.write_text("{not json")
+            self.assertEqual(tui.load_settings(p), {})
+            p.write_text("[1, 2]")
+            self.assertEqual(tui.load_settings(p), {})
