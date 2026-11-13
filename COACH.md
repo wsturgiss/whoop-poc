@@ -57,7 +57,31 @@ newer than the cursor is ever skipped.
 - `demo: true` marks synthetic data (`--demo`). Never treat it as the wearer's. Demo is never archived.
 - HR values in rows and workouts are 1-minute means (`max_hr` = the highest 1-minute mean).
   Zones are by heart-rate reserve: zone low bound = `rest_hr + fraction × (max_hr − rest_hr)`, with
-  Z1–Z5 at 50/60/70/80/90%. `zones` in the summary gives the bpm bounds in use.
+  Z1–Z5 at 50/60/70/80/90%. `zones` in the summary gives the bpm bounds in use, plus `max_hr_source`
+  and `observed_peak` (see "Max HR" below).
+
+## Max HR
+
+`max_hr` is resolved in this order; the first that applies wins:
+
+1. **Override**: `--max-hr N` on any command, else `WHOOP_MAX_HR` (environment, then
+   `~/.config/whoop-poc/env`). `max_hr_source: "override"`.
+2. **Observed**: the clean observed 5-s peak, when it is above 190. `max_hr_source: "observed"`.
+3. **Default**: 190. `max_hr_source: "default"`.
+
+The observed peak only ever raises max_hr above the default; a submaximal effort never lowers the zones.
+It is the highest mean over 5 consecutive seconds (≥ 4 readings, as `peak_hr_5s`) after dropping readings
+outside 30–230 bpm and one-off spikes (> 10 bpm from every reading within 2 s), and only where that mean is
+within 15 bpm of the mean over the 30 s either side, so a short burst of optical noise is not a peak.
+Every `coach` run and TUI reload checks the HR it loaded and raises the stored peak
+(`~/.local/state/whoop-poc/max-hr.json`, never whoop.db) when it finds a higher one.
+`whoop-poc coach maxhr` scans all stored HR and prints `zones`; `--clear` forgets the stored peak first.
+
+`observed_peak` is `{peak_hr_5s, peak_unix, local, workout_id}` (`workout_id` null when the peak is outside
+a detected workout), or null before any scan. Zone minutes are always computed with the max_hr in use, so
+`zone_min` in the summary, day views and workout views follows a change. Daily files carry the `zones` they
+were written with; a final day still inside the summary window is rewritten when the bounds change, older
+files keep theirs.
 
 ## Summary: `whoop-poc/snapshot@3`
 
@@ -75,7 +99,9 @@ newer than the cursor is ever skipped.
                 "hint": "strap out of range of baconstation (not advertising); no new data for 3 h 7 min"},
                                          // hint: only when last_sync is not_advertising and data is > 60 min old
   "latest_hr": {"unix": …, "bpm": 96},
-  "zones": {"max_hr": 190, "rest_hr": 60, "Z1": 125, "Z2": 138, "Z3": 151, "Z4": 164, "Z5": 177},
+  "zones": {"max_hr": 190, "rest_hr": 60, "Z1": 125, "Z2": 138, "Z3": 151, "Z4": 164, "Z5": 177,
+            "max_hr_source": "default",
+            "observed_peak": {"peak_hr_5s": 182, "peak_unix": …, "local": "11-11 08:42:08", "workout_id": "2026-11-11-0824"}},
   "sleep_source": "noop|heuristic",
   "days": [{                             // one per local day, oldest first
     "date": "2026-11-11", "start_unix": …,
@@ -257,12 +283,14 @@ asks: `1m` adds `hr_per_minute: [[minute_start_unix, bpm], …]` over the detect
     "avg_hr", "resting_hr", "avg_hrv_ms", "night",                            // night: see Sleep: nights and naps
     "stages": [{"start_unix", "end_unix", "stage": "light|rem|deep|wake"}]}]},   // stages: NOOP only
   "labels": [{"start_unix", "end_unix", "activity"}],
+  "zones": {…},                          // as in the summary: the bounds zone_min was computed with
   "hr_per_minute": [[minute_start_unix, mean_bpm], …]                          // worn minutes only
 }
 ```
 
 - A file is rewritten while its day is not `final` and its content changes. Once a file marked `final`
-  exists, it is never rewritten. A day that becomes final while out of the summary window stays as last
+  exists, it is rewritten only when its `zones` bounds differ from the ones in use (see "Max HR") or a
+  confirmation changes its workouts. A day that becomes final while out of the summary window stays as last
   written, with `final: false`.
 - Files older than `WHOOP_ARCHIVE_DAYS` (default 30) days are deleted on each write.
 - Days with no data at all get no file.
@@ -308,7 +336,8 @@ In `~/.config/whoop-poc/env` (or the environment):
 | `WHOOP_COACH_DAYS` | 7 | summary window, calendar days including today (`--days` overrides) |
 | `WHOOP_ARCHIVE_DAYS` | 30 | daily files kept; also how far back `coach since` reaches |
 | `WHOOP_TZ` | `America/New_York` | time zone for day boundaries and `local` strings |
-| `WHOOP_MAX_HR`, `WHOOP_RESTING_HR` | 190, 60 | heart-rate reserve for zones and workout detection |
+| `WHOOP_MAX_HR` | unset | max HR override (`--max-hr` beats it); unset = observed peak if above 190, else 190 (see "Max HR") |
+| `WHOOP_RESTING_HR` | 60 | resting HR for the heart-rate reserve |
 
 ## Reading it well
 

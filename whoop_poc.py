@@ -834,9 +834,57 @@ def start_live(minutes: float = LIVE_MINUTES) -> str:
     return msg
 
 
-# HR zones by heart-rate reserve (Karvonen): low bound = rest + fraction × (max − rest). Both inputs are
-# fixed settings (WHOOP_MAX_HR, WHOOP_RESTING_HR) so zones don't shift between reloads or windows.
-MAX_HR = int(os.environ.get("WHOOP_MAX_HR", 190))
+# HR zones by heart-rate reserve (Karvonen): low bound = rest + fraction × (max − rest). REST_HR is a
+# fixed setting (WHOOP_RESTING_HR). max_hr_info() resolves max: an override (WHOOP_MAX_HR, or --max-hr)
+# wins; otherwise the higher of DEFAULT_MAX_HR and the clean observed 5-s peak in MAX_HR_FILE, so an
+# observed peak only ever raises it. MAX_HR is the value in use; refresh_max_hr() re-reads it.
+DEFAULT_MAX_HR = 190
+MAX_HR_FILE = "max-hr.json"             # in STATE_DIR; written by coach.update_observed_max, never whoop.db
+MAX_HR_SCHEMA = "whoop-poc/max-hr@1"
+
+
+def observed_max() -> dict | None:
+    """The stored observed peak: {schema, peak_hr_5s, peak_unix, local, workout_id, set_unix}, or None."""
+    import json
+    try:
+        d = json.loads((STATE_DIR / MAX_HR_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and isinstance(d.get("peak_hr_5s"), int) else None
+
+
+def max_hr_info() -> dict:
+    """{"max_hr": bpm in use, "source": "override" | "observed" | "default", "observed": observed_max()}."""
+    obs = observed_max()
+    ov = os.environ.get("WHOOP_MAX_HR", "").strip()
+    if ov:
+        if not ov.isdigit():
+            raise SystemExit(f"WHOOP_MAX_HR / --max-hr must be a whole number of bpm, got {ov!r}")
+        return {"max_hr": int(ov), "source": "override", "observed": obs}
+    if obs and obs["peak_hr_5s"] > DEFAULT_MAX_HR:
+        return {"max_hr": obs["peak_hr_5s"], "source": "observed", "observed": obs}
+    return {"max_hr": DEFAULT_MAX_HR, "source": "default", "observed": obs}
+
+
+def refresh_max_hr() -> dict:
+    """Re-resolve MAX_HR (after an override is set or the observed peak rises); returns max_hr_info()."""
+    global MAX_HR
+    info = max_hr_info()
+    MAX_HR = info["max_hr"]
+    return info
+
+
+def max_hr_text(info: dict) -> str:
+    """'max 190 (default; observed 5-s peak 182, 11-11 08:42:08 in 2026-11-11-0824)'."""
+    o = info["observed"]
+    peak = o and f"observed 5-s peak {o['peak_hr_5s']}, {o['local']}" + \
+        (f" in {o['workout_id']}" if o.get("workout_id") else "")
+    if info["source"] == "observed":
+        return f"max {info['max_hr']} ({peak})"
+    label = "override WHOOP_MAX_HR" if info["source"] == "override" else "default"
+    return f"max {info['max_hr']} ({label}{'; ' + peak if peak else ''})"
+
+
 REST_HR = int(os.environ.get("WHOOP_RESTING_HR", 60))
 ZONES = (  # (zone, name, low fraction of HR reserve, color), highest first
     ("Z5", "max", 0.90, "#ef4444"),
@@ -846,20 +894,23 @@ ZONES = (  # (zone, name, low fraction of HR reserve, color), highest first
     ("Z1", "very light", 0.50, "#38bdf8"),
 )
 REST_ZONE = ("Z0", "rest", 0.0, "#6b7280")
+MAX_HR = max_hr_info()["max_hr"]
 BLOCKS = "▁▂▃▄▅▆▇█"
 LIVE_GAP_FILL_S = 5     # live graph: bridge reading gaps up to this long
 
 
-def zone_low(z: tuple, max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> int:
-    """Lowest whole bpm in a zone. hr_zone and zone_range both use this, so color and label always agree."""
+def zone_low(z: tuple, max_hr: int | None = None, rest_hr: int = REST_HR) -> int:
+    """Lowest whole bpm in a zone (max_hr None = MAX_HR now). hr_zone and zone_range both use this, so
+    color and label always agree."""
+    max_hr = MAX_HR if max_hr is None else max_hr
     return int(rest_hr + z[2] * (max_hr - rest_hr) + 0.5)
 
 
-def hr_zone(bpm: float, max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> tuple[str, str, float, str]:
+def hr_zone(bpm: float, max_hr: int | None = None, rest_hr: int = REST_HR) -> tuple[str, str, float, str]:
     return next((z for z in ZONES if bpm >= zone_low(z, max_hr, rest_hr)), REST_ZONE)
 
 
-def zone_range(z: tuple, max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> str:
+def zone_range(z: tuple, max_hr: int | None = None, rest_hr: int = REST_HR) -> str:
     """bpm range label for a zone, e.g. '136–147'."""
     if z is REST_ZONE:
         return f"<{zone_low(ZONES[-1], max_hr, rest_hr)}"
@@ -890,7 +941,7 @@ def last_live() -> dict | None:
         return None
 
 
-def zone_seconds(samples: list[tuple[int, int]], max_hr: int = MAX_HR, rest_hr: int = REST_HR) -> dict[str, int]:
+def zone_seconds(samples: list[tuple[int, int]], max_hr: int | None = None, rest_hr: int = REST_HR) -> dict[str, int]:
     """Seconds per zone; each sample counts until the next one (gaps over 5 s count as 1 s)."""
     out = {z[0]: 0 for z in (REST_ZONE,) + ZONES}
     for (t, b), nxt in zip(samples, samples[1:] + [None]):
@@ -899,7 +950,7 @@ def zone_seconds(samples: list[tuple[int, int]], max_hr: int = MAX_HR, rest_hr: 
     return out
 
 
-def zone_chart(points: list[tuple[int, float]], width: int, height: int = 6, max_hr: int = MAX_HR,
+def zone_chart(points: list[tuple[int, float]], width: int, height: int = 6, max_hr: int | None = None,
                t0: int | None = None, t1: int | None = None, agg: str = "mean",
                gap_fill_s: float = LIVE_GAP_FILL_S, rest_hr: int = REST_HR) -> list[str]:
     """Rich-markup bar chart of (unix, bpm) points over [t0, t1]: one column per time slice (its mean or
@@ -948,7 +999,7 @@ def zone_chart(points: list[tuple[int, float]], width: int, height: int = 6, max
     return lines
 
 
-def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_hr: int = MAX_HR,
+def live_chart(samples: list[tuple[int, int]], width: int, height: int = 6, max_hr: int | None = None,
                t1: int | None = None, rest_hr: int = REST_HR) -> list[str]:
     """Live session chart: mean bpm per slice, short gaps bridged, start → end time axis underneath."""
     if not samples or width < 10:
@@ -1131,10 +1182,11 @@ def start_sync_background() -> tuple[bool, str]:
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="whoop-poc", description=__doc__.splitlines()[0])
     p.add_argument("cmd", nargs="?", default="tui", choices=["tui", "summary", "html", "coach", "json", "serve"])
-    p.add_argument("rest", nargs="*", help="coach: since <unix> | day <YYYY-MM-DD> | workout <id> | confirm <id>")
+    p.add_argument("rest", nargs="*", help="coach: since <unix> | day <YYYY-MM-DD> | workout <id> | confirm <id> | maxhr")
     p.add_argument("--minutes", type=int, help="coach confirm: the wearer's duration for the workout, minutes")
     p.add_argument("--start", help="coach confirm: the wearer's start time, HH:MM on the workout's day (optional)")
-    p.add_argument("--clear", action="store_true", help="coach confirm: remove the workout's confirmation")
+    p.add_argument("--clear", action="store_true", help="coach confirm: remove the workout's confirmation; "
+                   "coach maxhr: forget the stored observed peak before scanning")
     p.add_argument("--kind", help="coach workout: run (default fields) or lift (set detection instead of cardio fields)")
     p.add_argument("--series", help="coach workout: also return HR as 1m (per minute) or 10s means")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"NOOP whoop.db (default {DEFAULT_DB}; env WHOOP_DB)")
@@ -1152,7 +1204,11 @@ def main(argv=None) -> None:
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
     p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")
+    p.add_argument("--max-hr", type=int, help="max HR for zones, bpm: overrides WHOOP_MAX_HR and the observed peak")
     a = p.parse_args(argv)
+    if a.max_hr is not None:            # child processes (the TUI's report worker) inherit it
+        os.environ["WHOOP_MAX_HR"] = str(a.max_hr)
+    refresh_max_hr()
     if a.rest and a.cmd != "coach":
         p.error(f"unexpected arguments: {' '.join(a.rest)}")
     a.db = a.db.expanduser()

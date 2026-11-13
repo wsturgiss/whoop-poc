@@ -297,3 +297,97 @@ class TuiWorkouts(unittest.TestCase):
         self.assertIn(f"0h 18m (confirmed; detected {w.dur(c['detected_min'])})", tui.workout_lines(c))
         self.assertEqual(tui.zones_text({"Z3": 14, "Z4": 4}), "Z3 14 · Z4 4")
         self.assertEqual(tui.recovery_text({"drop_1min": None}), "—")
+
+
+class MaxHr(unittest.TestCase):
+    """Observed max HR: clean 5 s peak, auto-raise, override precedence, and zones following max_hr."""
+
+    def setUp(self):
+        self.addCleanup(w.refresh_max_hr)                   # runs last: back to the real settings
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for p in (mock.patch.object(w, "STATE_DIR", Path(self.tmp.name)),
+                  mock.patch.dict("os.environ", {}, clear=False)):
+            p.start()
+            self.addCleanup(p.stop)
+        import os
+        os.environ.pop("WHOOP_MAX_HR", None)
+        w.refresh_max_hr()
+        # the 20-min run at 160 from WorkoutView, ending with a 30 s climb to 196 held for a minute
+        self.hr = hr_trace((300, 80), (1110, 160), (30, 160, 196), (60, 196), (61, 196, 100), (60, 100, 90),
+                           (600, 80), t0=T0 - 300)
+
+    def test_clean_hr_drops_spikes_and_out_of_range(self):
+        hr = {T0 + i: 150 for i in range(10)}
+        hr[T0 + 4], hr[T0 + 7] = 205, 250
+        c = wd.clean_hr(hr)
+        self.assertNotIn(T0 + 4, c)                          # one second 55 bpm above its neighbours
+        self.assertNotIn(T0 + 7, c)                          # outside HR_RANGE
+        self.assertEqual(len(c), 8)
+
+    def test_clean_peak_ignores_noise_bursts(self):
+        hr = hr_trace((120, 150), (60, 150, 175), (60, 175))
+        bpm, t = wd.clean_peak(hr)
+        self.assertEqual(bpm, 175)
+        noisy = dict(hr)
+        for i in range(8):                                   # 8 s locked 40 bpm high (an optical artifact)
+            noisy[T0 + 60 + i] = 190
+        self.assertEqual(wd.clean_peak(noisy)[0], 175)
+        self.assertGreater(wd.peak_5s(noisy), 175)           # the unfiltered 5 s peak takes the burst
+
+    def test_auto_raise_keeps_the_highest_and_names_the_workout(self):
+        win = window(self.hr)
+        rec = coach.update_observed_max(win.r)
+        self.assertEqual((rec["peak_hr_5s"], rec["workout_id"]), (196, "2026-11-11-0824"))
+        self.assertEqual(w.max_hr_info()["source"], "observed")
+        self.assertEqual(w.MAX_HR, 196)
+        lower = window(hr_trace((300, 80), (1200, 160), t0=T0 - 300))
+        self.assertIsNone(coach.update_observed_max(lower.r))   # a lower peak never lowers it
+        self.assertEqual(w.observed_max()["peak_hr_5s"], 196)
+
+    def test_observed_below_default_keeps_default(self):
+        coach.update_observed_max(window(hr_trace((300, 80), (1200, 182), t0=T0 - 300)).r)
+        info = w.max_hr_info()
+        self.assertEqual((info["max_hr"], info["source"], info["observed"]["peak_hr_5s"]),
+                         (w.DEFAULT_MAX_HR, "default", 182))
+        self.assertIn("default; observed 5-s peak 182", w.max_hr_text(info))
+
+    def test_override_wins(self):
+        import os
+        coach.update_observed_max(window(self.hr).r)
+        os.environ["WHOOP_MAX_HR"] = "185"
+        info = w.refresh_max_hr()
+        self.assertEqual((info["max_hr"], info["source"], w.MAX_HR), (185, "override", 185))
+        self.assertEqual(coach.zones()["max_hr_source"], "override")
+        self.assertEqual(coach.zones()["observed_peak"]["peak_hr_5s"], 196)
+        os.environ["WHOOP_MAX_HR"] = "fast"
+        self.assertRaises(SystemExit, w.max_hr_info)
+
+    def test_cli_flag_sets_the_override(self):
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            w.main(["coach", "maxhr", "--demo", "--max-hr", "200"])
+        self.assertEqual((w.MAX_HR, w.max_hr_info()["source"]), (200, "override"))
+
+    def test_zone_min_follows_max_hr(self):
+        import os
+        z190 = window(self.hr).workouts[0]["zone_min"]
+        os.environ["WHOOP_MAX_HR"] = "210"
+        w.refresh_max_hr()
+        z210 = window(self.hr).workouts[0]["zone_min"]
+        # 160 bpm is Z3 (151–163) at max 190 and Z2 (150–164) at max 210
+        self.assertEqual((max(z190, key=z190.get), max(z210, key=z210.get)), ("Z3", "Z2"))
+        self.assertEqual((coach.zones()["max_hr"], coach.zones()["Z3"]), (210, 165))
+
+    def test_final_archive_day_rebuilt_when_zones_change(self):
+        import json, os
+        win = window(self.hr)
+        d = coach.local_date(T0)
+        out = Path(self.tmp.name) / "daily"
+        out.mkdir()
+        p = out / f"{d.isoformat()}.json"
+        p.write_text(json.dumps({**coach.day_doc(win, d), "final": True}))
+        self.assertEqual(coach.write_archive(win, [d], out, today=d), [])      # same zones: left alone
+        os.environ["WHOOP_MAX_HR"] = "210"
+        w.refresh_max_hr()
+        self.assertEqual(coach.write_archive(window(self.hr), [d], out, today=d), [p])
+        self.assertEqual(json.loads(p.read_text())["zones"]["max_hr"], 210)

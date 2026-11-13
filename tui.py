@@ -69,7 +69,7 @@ def workout_lines(x: dict, now: int | None = None) -> str:
         mins = f"≈{core.dur(x['duration_min'])} likely workout (elevated HR, not confirmed)"
     rec = recovery_text(x["recovery"])
     return (f"[b]Last workout[/]  {core.window_label(x['start_unix'], x['end_unix'], now)}  [dim]{x['id']}[/]\n"
-            f"{mins} · avg {x['avg_hr']} / max {x['max_hr']} bpm"
+            f"{mins} · avg {x['avg_hr']} / max {x['max_hr']} bpm (1-min means) · peak {x['peak_hr_5s']} (5 s)"
             + (f" · HR {rec} after 1 min" if rec != "—" else ""))
 
 
@@ -132,6 +132,7 @@ class WhoopApp(App):
         self._report: core.Report | None = None
         self._building = self._rebuild = False
         self._exiting = False
+        self._max_hr = core.max_hr_info()
         self._settings = load_settings()
         hours = self._settings.get("hours")
         if not getattr(args, "hours_explicit", False) and hours in WINDOW_STEPS:
@@ -262,14 +263,13 @@ class WhoopApp(App):
             head.update(f"[red]♡[/] [b]LIVE HR[/]  {msg}    {tail}")
         self._render_live_graph(d, chart, key, ended=False)
 
-    @staticmethod
-    def zone_key(secs: dict[str, int]) -> str:
+    def zone_key(self, secs: dict[str, int]) -> str:
         """Color key: each zone's swatch, bpm range and time in it (m:ss under an hour, else XhYYm)."""
         def t(v):
             return f"{v // 60}:{v % 60:02d}" if v < 3600 else f"{v // 3600}h{v % 3600 // 60:02d}m"
         return "   ".join(f"[{z[3]}]█[/] {z[0]} {core.zone_range(z)} [b]{t(secs[z[0]])}[/]"
                           for z in (core.REST_ZONE,) + core.ZONES[::-1]) + \
-            f"   [dim]HR reserve: rest {core.REST_HR}, max {core.MAX_HR}[/]"
+            f"   [dim]HR reserve: rest {core.REST_HR}, {core.max_hr_text(self._max_hr)}[/]"
 
     def _render_live_graph(self, d: dict, chart: Static, key: Static, ended: bool) -> bool:
         """Draw the session graph + zone key; True if there was enough data to draw."""
@@ -387,6 +387,7 @@ class WhoopApp(App):
         self.action_reload()
 
     def render_report(self, r: core.Report) -> None:
+        self._max_hr = core.refresh_max_hr()       # the report worker may have raised the observed peak
         self.sub_title = r.meta.get("name") or r.meta["address"]
         self.query_one("#meta", Static).update(
             f"window: last {(r.until - r.since) // 3600}h [dim](w to change)[/] · newest data "
@@ -492,10 +493,10 @@ class WhoopApp(App):
         note.update("")
         last.update(workout_lines(xs[-1]))
         table.display = True
-        table.add_columns("ID", "Status", "Duration", "Avg HR", "Max HR", "Zones (min)", "HR drop 1m")
+        table.add_columns("ID", "Status", "Duration", "Avg HR", "Max 1m", "Peak 5s", "Zones (min)", "HR drop 1m")
         for x in reversed(xs):
             table.add_row(x["id"], workout_status(x), core.dur(x["duration_min"]), str(x["avg_hr"]),
-                          str(x["max_hr"]), zones_text(x["zone_min"]), recovery_text(x["recovery"]))
+                          str(x["max_hr"]), str(x["peak_hr_5s"] or "—"), zones_text(x["zone_min"]), recovery_text(x["recovery"]))
 
 
 def make_report_pool():

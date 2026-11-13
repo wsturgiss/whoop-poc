@@ -15,6 +15,12 @@ import whoop_poc as w
 
 PEAK_WINDOW_S = 5          # peak_hr_5s: highest mean over this many consecutive seconds ...
 PEAK_MIN_VALID = 4         # ... with at least this many HR readings in the window
+HR_RANGE = (30, 230)       # clean_hr: readings outside this are sensor errors
+SPIKE_BPM = 10             # ... a reading this far from every reading within SPIKE_NEAR_S of it is a spike
+SPIKE_NEAR_S = 2
+PEAK_CONTEXT_S = 30        # clean_peak: the 5 s mean must be within PEAK_CONTEXT_BPM of the mean over
+PEAK_CONTEXT_BPM = 15      # ... PEAK_CONTEXT_S either side (a short burst of noise is not a peak) ...
+PEAK_CONTEXT_MIN_VALID = 30   # ... which needs at least this many readings
 BIN_S = 10                 # HR bins for intervals, drift and the 10 s series
 BIN_MIN_VALID = 5          # a bin needs this many HR readings
 RECOVERY_PROBE_S = 5       # HR at a moment = mean over this many seconds (ending at effort end; centred after)
@@ -57,6 +63,35 @@ def peak_5s(hr: dict[int, int]) -> int | None:
         if m is not None and (best is None or m > best):
             best = m
     return None if best is None else round(best)
+
+
+def clean_hr(hr: dict[int, int]) -> dict[int, int]:
+    """hr without readings outside HR_RANGE and without spikes: a reading more than SPIKE_BPM from every
+    reading within SPIKE_NEAR_S seconds of it. A reading with no neighbours is kept."""
+    out = {}
+    for t, v in hr.items():
+        if not HR_RANGE[0] <= v <= HR_RANGE[1]:
+            continue
+        near = [hr[u] for u in range(t - SPIKE_NEAR_S, t + SPIKE_NEAR_S + 1) if u != t and u in hr]
+        if near and all(abs(v - x) > SPIKE_BPM for x in near):
+            continue
+        out[t] = v
+    return out
+
+
+def clean_peak(hr: dict[int, int]) -> tuple[int, int] | None:
+    """(bpm, window start unix) of the highest clean 5 s peak: peak_5s's window mean over clean_hr
+    readings, kept only where it is within PEAK_CONTEXT_BPM of the mean over PEAK_CONTEXT_S either side."""
+    c = clean_hr(hr)
+    best = None
+    for t in c:
+        m = mean_over(c, t, t + PEAK_WINDOW_S, PEAK_MIN_VALID)
+        if m is None or (best is not None and m <= best[0]):
+            continue
+        ctx = mean_over(c, t - PEAK_CONTEXT_S, t + PEAK_WINDOW_S + PEAK_CONTEXT_S, PEAK_CONTEXT_MIN_VALID)
+        if ctx is not None and m - ctx <= PEAK_CONTEXT_BPM:
+            best = (m, t)
+    return None if best is None else (round(best[0]), best[1])
 
 
 def bins(hr: dict[int, int], a: int, b: int, size: int = BIN_S) -> list[tuple[int, float]]:

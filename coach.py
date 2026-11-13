@@ -10,6 +10,8 @@ arrays. Per-minute HR and sleep stage segments live in whoop.db and in the daily
   whoop-poc coach workout <id>         one workout's computed detail (peaks, recovery, drift, intervals, …)
   whoop-poc coach confirm <id> --minutes N [--start HH:MM]
                                        record the wearer's confirmed duration (--clear removes it)
+  whoop-poc coach maxhr [--clear]      scan all stored HR for the clean observed 5-s peak; show max_hr
+                                       and its source (--clear forgets the stored peak first)
 """
 from __future__ import annotations
 
@@ -331,7 +333,37 @@ def trends(rows: list[dict]) -> dict:
 def load(db: Path, first: date, now: int, address=None, demo=False, heuristic=False) -> Window:
     since = day_bounds(first)[0] - SLEEP_LEAD_S
     r = w.build_report(db, (now - since) / 3600, address, now=now, demo=demo, heuristic=heuristic)
+    update_observed_max(r)
     return Window(r, now)
+
+
+def update_observed_max(r: w.Report) -> dict | None:
+    """Raise MAX_HR_FILE when r's samples hold a clean 5-s peak above the stored one (never for demo data),
+    then re-resolve w.MAX_HR. Returns the new record, or None if nothing was raised."""
+    rec = None
+    found = None if r.meta.get("address") == "-" else wd.clean_peak({s.unix: s.hr for s in r.samples if s.hr > 0})
+    old = w.observed_max()
+    if found and (old is None or found[0] > old["peak_hr_5s"]):
+        bpm, t = found
+        x = next((x for x in detect_workouts(r.hr_minutes) if x["start_unix"] <= t < x["end_unix"]), None)
+        rec = {"schema": w.MAX_HR_SCHEMA, "peak_hr_5s": bpm, "peak_unix": t,
+               "local": datetime.fromtimestamp(t, TZ).strftime("%m-%d %H:%M:%S"),
+               "workout_id": x["id"] if x else None, "set_unix": int(time.time())}
+        w.write_json(w.STATE_DIR / w.MAX_HR_FILE, rec)
+    w.refresh_max_hr()
+    return rec
+
+
+def scan_max_hr(db: Path, address=None, clear: bool = False) -> dict:
+    """`coach maxhr`: update_observed_max over every stored sample (read-only on whoop.db), then max_hr and
+    its source with the zone bounds in use. clear first forgets the stored peak."""
+    if clear:
+        (w.STATE_DIR / w.MAX_HR_FILE).unlink(missing_ok=True)
+    now = int(time.time())
+    samples, meta = w.load_samples(db, 0, now + 300, address)
+    r = w.Report(meta, samples[0].unix if samples else now, now, samples, w.per_minute(samples), [])
+    raised = update_observed_max(r)
+    return {"zones": zones(), "raised": raised is not None}
 
 
 def freshness(win: Window) -> dict:
@@ -348,8 +380,17 @@ def freshness(win: Window) -> dict:
     return out
 
 
-def zones() -> dict:
+def zone_bounds() -> dict:
     return {"max_hr": w.MAX_HR, "rest_hr": w.REST_HR, **{z[0]: w.zone_low(z) for z in w.ZONES[::-1]}}
+
+
+def zones() -> dict:
+    """The zone bounds in use, max_hr_source ("override" | "observed" | "default") and observed_peak (the
+    clean observed 5-s peak: {peak_hr_5s, peak_unix, local, workout_id}, or null)."""
+    info = w.max_hr_info()
+    o = info["observed"]
+    return {**zone_bounds(), "max_hr_source": info["source"],
+            "observed_peak": o and {k: o.get(k) for k in ("peak_hr_5s", "peak_unix", "local", "workout_id")}}
 
 
 def summary(win: Window, days: list[date], since: int | None = None) -> dict:
@@ -397,7 +438,7 @@ def day_doc(win: Window, d: date) -> dict:
         "workouts": win.day_workouts(d), "gaps": win.day_gaps(d),
         "sleep": {"source": win.r.meta.get("sleep_source"), "sessions": [{**w.sleep_session(s), "night": is_night(s)}
                                                                 for s in win.day_sleep(d)]},
-        "labels": labels,
+        "labels": labels, "zones": zones(),
         "hr_per_minute": [[m.t, round(m.hr, 1)] for m in win.day_mins(d)],
     }
 
@@ -466,7 +507,7 @@ def workout_view(win: Window, t: int, kind: str | None = None, series: str | Non
 
 
 TUI_WORKOUT_KEYS = ("id", "start_unix", "end_unix", "duration_min", "detected_min", "confirmed",
-                    "avg_hr", "max_hr", "zone_min", "recovery")
+                    "avg_hr", "max_hr", "peak_hr_5s", "zone_min", "recovery")
 
 
 def workout_rows(win: Window) -> list[dict]:
@@ -479,6 +520,7 @@ def report_with_workouts(*args, **kw) -> w.Report:
     """w.build_report_slim plus meta["workouts"] = workout_rows, computed before the samples are dropped
     (recovery needs per-second HR). The TUI's report builder."""
     r = w.build_report(*args, **kw)
+    update_observed_max(r)
     r.meta["workouts"] = workout_rows(Window(r, r.until))
     return w.slim_report(r)
 
@@ -499,7 +541,8 @@ def write_archive(win: Window, days: list[date], out_dir: Path, keep_days: int =
             old = json.loads(p.read_text())
         except (OSError, ValueError):
             old = None
-        if old and old.get("final"):
+        bounds = {k: (old or {}).get("zones", {}).get(k) for k in zone_bounds()}
+        if old and old.get("final") and bounds == zone_bounds():      # zones changed: rebuild it below
             if patch_day_file(p, win.confirmations, old):
                 written.append(p)
             continue
@@ -631,8 +674,12 @@ def run(a, rest: list[str]) -> tuple[dict, int]:
         return doc, 0
     if sub == "confirm" and len(rest) == 2:
         return confirm(a, rest, now)
+    if sub == "maxhr" and len(rest) == 1:
+        if a.demo:
+            return {"error": "maxhr reads the stored HR; not with --demo"}, 2
+        return scan_max_hr(a.db, a.address, clear=getattr(a, "clear", False)), 0
     return {"error": "usage: whoop-poc coach [since <unix> | day <YYYY-MM-DD|today|yesterday> | workout <id|unix|HH:MM|ISO> [--kind run|lift] [--series 1m|10s]"
-                     " | confirm <start> (--minutes N [--start HH:MM] | --clear)]"}, 2
+                     " | confirm <start> (--minutes N [--start HH:MM] | --clear) | maxhr [--clear]]"}, 2
 
 
 def write_snapshot(a, out: Path, archive: bool = True) -> dict:
