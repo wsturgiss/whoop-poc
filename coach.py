@@ -465,6 +465,24 @@ def workout_view(win: Window, t: int, kind: str | None = None, series: str | Non
     return doc
 
 
+TUI_WORKOUT_KEYS = ("id", "start_unix", "end_unix", "duration_min", "detected_min", "confirmed",
+                    "avg_hr", "max_hr", "zone_min", "recovery")
+
+
+def workout_rows(win: Window) -> list[dict]:
+    """The window's workouts, oldest first, with the workout@2 fields the TUI shows."""
+    return [{k: doc[k] for k in TUI_WORKOUT_KEYS}
+            for doc in (workout_view(win, x["start_unix"]) for x in win.workouts)]
+
+
+def report_with_workouts(*args, **kw) -> w.Report:
+    """w.build_report_slim plus meta["workouts"] = workout_rows, computed before the samples are dropped
+    (recovery needs per-second HR). The TUI's report builder."""
+    r = w.build_report(*args, **kw)
+    r.meta["workouts"] = workout_rows(Window(r, r.until))
+    return w.slim_report(r)
+
+
 # --------------------------------------------------------------------------------------- archive
 def _comparable(doc: dict) -> dict:
     return {k: v for k, v in doc.items() if k not in ("generated_unix", "newest_sample_unix")}

@@ -266,3 +266,34 @@ class WorkoutView(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TuiWorkouts(unittest.TestCase):
+    """coach.workout_rows (the TUI's workout fields) and the TUI's text for them."""
+
+    def setUp(self):
+        self.hr = hr_trace((300, 80), (1200, 160), (61, 160, 100), (60, 100, 90), (600, 80), t0=T0 - 300)
+
+    def test_rows_carry_workout_view_fields(self):
+        (x,) = coach.workout_rows(window(self.hr))
+        self.assertEqual(set(x), set(coach.TUI_WORKOUT_KEYS))
+        self.assertEqual((x["id"], x["confirmed"], x["recovery"]["drop_1min"]), ("2026-11-11-0824", False, 59))
+
+    def test_report_with_workouts_drops_samples(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(w, "STATE_DIR", Path(d)):
+            r = coach.report_with_workouts(None, 24, None, now=1793880000, demo=True, heuristic=True)
+        self.assertEqual(r.meta["workouts"], [])            # the demo night has no workout
+        self.assertLessEqual(len(r.samples), 1)
+
+    def test_tui_text_marks_unconfirmed_and_uses_confirmed_minutes(self):
+        import tui
+        (x,) = coach.workout_rows(window(self.hr))
+        self.assertEqual(tui.workout_status(x), "likely workout")
+        self.assertIn("likely workout (elevated HR, not confirmed)", tui.workout_lines(x))
+        self.assertIn("HR −59 bpm after 1 min", tui.workout_lines(x))
+        start = x["start_unix"]
+        (c,) = coach.workout_rows(window(self.hr, confirmations=[{"start_unix": start, "minutes": 18, "set_unix": 0}]))
+        self.assertEqual((tui.workout_status(c), c["duration_min"]), ("confirmed", 18))
+        self.assertIn(f"0h 18m (confirmed; detected {w.dur(c['detected_min'])})", tui.workout_lines(c))
+        self.assertEqual(tui.zones_text({"Z3": 14, "Z4": 4}), "Z3 14 · Z4 4")
+        self.assertEqual(tui.recovery_text({"drop_1min": None}), "—")

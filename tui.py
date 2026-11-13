@@ -13,6 +13,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Static
 
+import coach
 import whoop_poc as core
 
 
@@ -43,6 +44,33 @@ def save_settings(d: dict, path: Path = SETTINGS_PATH) -> None:
         tmp.replace(path)
     except OSError:
         pass
+
+
+def workout_status(x: dict) -> str:
+    return "confirmed" if x["confirmed"] else "likely workout"
+
+
+def zones_text(z: dict[str, int]) -> str:
+    """'Z3 14 · Z4 4': minutes per zone, Z1 first, zero zones left out."""
+    return " · ".join(f"{k} {v}" for k, v in z.items()) or "—"
+
+
+def recovery_text(rec: dict) -> str:
+    """HR drop 1 min after the effort end ('−59 bpm'), or '—' when workout@2 has none."""
+    d = rec.get("drop_1min")
+    return "—" if d is None else f"−{d} bpm" if d >= 0 else f"+{-d} bpm"
+
+
+def workout_lines(x: dict, now: int | None = None) -> str:
+    """The two lines above the workouts table for the newest workout (a workout_rows record)."""
+    if x["confirmed"]:
+        mins = f"{core.dur(x['duration_min'])} (confirmed; detected {core.dur(x['detected_min'])})"
+    else:
+        mins = f"≈{core.dur(x['duration_min'])} likely workout (elevated HR, not confirmed)"
+    rec = recovery_text(x["recovery"])
+    return (f"[b]Last workout[/]  {core.window_label(x['start_unix'], x['end_unix'], now)}  [dim]{x['id']}[/]\n"
+            f"{mins} · avg {x['avg_hr']} / max {x['max_hr']} bpm"
+            + (f" · HR {rec} after 1 min" if rec != "—" else ""))
 
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -77,7 +105,8 @@ class WhoopApp(App):
     Tile { border: round $panel-lighten-2; width: 1fr; height: 5; padding: 0 1; }
     #hr-chart { height: auto; margin-top: 1; }
     #hr-key { height: auto; color: $text-muted; }
-    #hr-axis, #sleep-note, #hypno-legend { color: $text-muted; height: auto; }
+    #hr-axis, #sleep-note, #hypno-legend, #workout-note { color: $text-muted; height: auto; }
+    #workout-last { height: auto; margin-bottom: 1; }
     #hypno { color: $accent; height: auto; margin-top: 1; }
     DataTable { height: auto; max-height: 8; }
     /* ANSI themes: the header uses the terminal's own fg/bg pair, so it reads in any palette */
@@ -137,6 +166,10 @@ class WhoopApp(App):
             with Vertical():
                 yield Static(id="hypno")
                 yield Static(id="hypno-legend")
+            yield Static("WORKOUTS", id="workout-head", classes="h")
+            yield Static(id="workout-note")
+            yield Static(id="workout-last")
+            yield DataTable(id="workout-table", cursor_type="row", zebra_stripes=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -292,7 +325,7 @@ class WhoopApp(App):
         self._building, self._rebuild = True, False
         hours = self.args.hours
         self.render_meta_loading()
-        args = (core.build_report_slim, self.args.db, hours, self.args.address)
+        args = (coach.report_with_workouts, self.args.db, hours, self.args.address)
         try:
             fut = self._pool.submit(*args, demo=self.args.demo) if self._pool else None
         except Exception:                       # worker died / pool broken: fall back to a thread
@@ -400,10 +433,11 @@ class WhoopApp(App):
                         "no heart-rate data in this window: wear the strap, then press s to sync"
                         if not self._drain else "nothing in this window yet: waiting for the drain to start")
 
+        self.render_workouts(r)
         staged = r.meta.get("sleep_source") == "noop"
         self.query_one("#sleep-head", Static).update(
             f"SLEEP  [dim]{core.SLEEP_SOURCE_LABEL[r.meta.get('sleep_source', 'heuristic')]}[/]")
-        table = self.query_one(DataTable)
+        table = self.query_one("#sleep-table", DataTable)
         table.clear(columns=True)
         table.add_columns("Window", "In bed", "Asleep ≈", "Eff.", "Avg HR", "Low HR",
                           *(("Deep", "Light", "REM", "Wake", "Rest HR", "HRV") if staged else ()))
@@ -440,6 +474,28 @@ class WhoopApp(App):
         hyp.update(f"[b]Last sleep[/]  {core.window_label(last.start, last.end)}\n"
                    f"{core.sleep_hours(last)}\n{bar}\n[dim]{ticks}[/]\n{labels}")
         legend.update(legend_txt)
+
+
+    def render_workouts(self, r: core.Report) -> None:
+        xs = r.meta.get("workouts", [])
+        self.query_one("#workout-head", Static).update(
+            "WORKOUTS  [dim](detected from elevated HR; confirm: whoop-poc coach confirm <id> --minutes N)[/]")
+        note, last = self.query_one("#workout-note", Static), self.query_one("#workout-last", Static)
+        table = self.query_one("#workout-table", DataTable)
+        table.clear(columns=True)
+        if not xs:
+            note.update(f"No workouts in this window: needs ≥{coach.WORKOUT_MIN} min at "
+                        f"{coach.WORKOUT_ZONE[0]}+ HR (≥{core.zone_low(coach.WORKOUT_ZONE):.0f} bpm). Press w for a longer window.")
+            last.update("")
+            table.display = False
+            return
+        note.update("")
+        last.update(workout_lines(xs[-1]))
+        table.display = True
+        table.add_columns("ID", "Status", "Duration", "Avg HR", "Max HR", "Zones (min)", "HR drop 1m")
+        for x in reversed(xs):
+            table.add_row(x["id"], workout_status(x), core.dur(x["duration_min"]), str(x["avg_hr"]),
+                          str(x["max_hr"]), zones_text(x["zone_min"]), recovery_text(x["recovery"]))
 
 
 def make_report_pool():

@@ -367,7 +367,11 @@ def build_report(db: Path, hours: float, address: str | None, now: int | None = 
 def build_report_slim(*args, **kw) -> Report:
     """build_report without the per-second samples (only the latest worn one, for hr_now), so it is cheap
     to pickle back from the TUI's worker process."""
-    r = build_report(*args, **kw)
+    return slim_report(build_report(*args, **kw))
+
+
+def slim_report(r: Report) -> Report:
+    """Drop the per-second samples, keeping only the latest worn one (for hr_now)."""
     r.samples = [s for s in (r.hr_now,) if s is not None]
     return r
 
