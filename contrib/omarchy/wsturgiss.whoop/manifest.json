@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "wsturgiss.whoop",
+  "name": "Whoop",
+  "version": "0.1.0",
+  "author": "William Sturgiss",
+  "license": "MIT",
+  "description": "Latest heart rate, last sleep and sync state from the local whoop-poc API, with a panel to sync or start a live HR session.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Whoop",
+    "description": "Heart rate and last sleep from whoop-poc's local API (127.0.0.1). Left click: panel. Middle: TUI. Right: sync.",
+    "category": "Info",
+    "aliases": ["whoop", "heart", "hr", "sleep"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "staleMinutes": 60,
+      "showSleep": true,
+      "liveMinutes": 30,
+      "apiPort": 8787
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Status poll interval (seconds)", "min": 5, "max": 300, "step": 5, "defaultValue": 15, "description": "How often to read /v1/status. A live session polls every 2 s and a running sync every 5 s regardless." },
+      { "key": "staleMinutes", "type": "integer", "label": "Stale after (minutes)", "min": 15, "max": 1440, "step": 15, "defaultValue": 60, "description": "Dim the widget and show a warning icon when the newest strap data is older than this." },
+      { "key": "showSleep", "type": "boolean", "label": "Show last sleep in the bar", "defaultValue": true },
+      { "key": "liveMinutes", "type": "integer", "label": "Live session length (minutes)", "min": 1, "max": 180, "step": 5, "defaultValue": 30 },
+      { "key": "apiPort", "type": "integer", "label": "API port", "min": 1024, "max": 65535, "step": 1, "defaultValue": 8787, "description": "Port of whoop-poc serve on 127.0.0.1 (WHOOP_API_PORT)." }
+    ]
+  }
+}
