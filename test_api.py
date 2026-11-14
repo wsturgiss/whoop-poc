@@ -205,6 +205,21 @@ class Server(StateDir):
             code, body = self.call(srv, "POST", "/v1/live/stop", b"", {"Content-Type": "application/json"})
         self.assertEqual((code, json.loads(body)), (200, {"stopped": False}))
 
+    def test_log_skips_polls_and_never_has_queries(self):
+        lines = []
+        srv = api.make_server(DEMO, "127.0.0.1", 0, log=lines.append)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.call(srv, "GET", "/v1/status")
+        self.call(srv, "GET", "/v1/live?since=1")
+        self.call(srv, "GET", "/v1/report?hours=2&bins=40")
+        self.call(srv, "GET", "/v1/nope?x=secret")
+        with mock.patch.object(w, "stop_live", return_value=False):
+            self.call(srv, "POST", "/v1/live/stop", b"{}", {"Content-Type": "application/json"})
+        self.assertEqual([ln.rsplit(" ", 1)[0] for ln in lines],
+                         ["GET /v1/report 200", "GET /v1/nope 404", "POST /v1/live/stop 200"])
+
     def test_heavy_routes_use_the_pool(self):
         calls = []
 

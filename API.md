@@ -24,8 +24,9 @@ systemctl --user start whoop-api   # the unit below
   - a POST must send `Content-Type: application/json`, otherwise `415`. A web page on another origin
     can't send that without a CORS preflight, and the server sends no CORS headers, so a browser tab
     can't start a sync or a live session.
-- **Logging:** one line per request to stderr (the journal under systemd): method, path, status, time.
-  No query strings, bodies, or config values.
+- **Logging:** to stderr (the journal under systemd), one line per POST, per error and per heavy read
+  (report, summary, snapshot), with method, path, status and time. The status and live polls aren't
+  logged. Query strings, bodies and config values never are.
 - **Data:** whoop.db is opened read-only. Syncs and live sessions the API starts run detached, exactly as
   from the TUI. Heavy reads (report, summary, snapshot) run in one worker process, so `/v1/status` and
   `/v1/live` answer immediately while a report builds.

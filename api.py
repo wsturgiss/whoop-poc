@@ -304,7 +304,7 @@ def make_server(cfg, host: str = HOST, port_: int = DEFAULT_PORT, pool=None, log
             u = urlsplit(self.path)
             code, doc = self._route(method, u.path, dict(parse_qsl(u.query)))
             self._reply(code, doc)
-            if log:
+            if log and (method != "GET" or code >= 400 or is_heavy(method, u.path)):   # not the 1 Hz polls
                 log(f"{method} {u.path} {code} {1000 * (time.monotonic() - t0):.0f}ms")
 
         def _route(self, method: str, path: str, query: dict) -> tuple[int, dict]:
