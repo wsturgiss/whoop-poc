@@ -7,7 +7,7 @@ time. Never scrape the TUI or HTML.
 
 | What | How | Size |
 |---|---|---|
-| **Summary** (`whoop-poc/snapshot@3`) | file `~/.local/state/whoop-poc/coach.json`, or `whoop-poc coach`, or `GET http://127.0.0.1:8787/v1/coach` | ~2–3.5 KB |
+| **Summary** (`whoop-poc/snapshot@3`) | file `~/.local/state/whoop-poc/coach.json`, or `whoop-poc coach`, or `GET http://127.0.0.1:8787/v1/summary` (API.md) | ~2–3.5 KB |
 | New since a cursor | `whoop-poc coach since <cursor_unix>`, or `GET /v1/coach?since=<unix>` | smaller |
 | One day | `whoop-poc coach day 2026-11-11` (also `today`, `yesterday`) | ~1–2 KB |
 | One workout, computed detail (`whoop-poc/workout@2`) | `whoop-poc coach workout <id>`, e.g. `2026-11-11-0824` (also `start_unix`, `HH:MM`, `2026-11-11T08:24`) | ~1 KB |

@@ -12,6 +12,8 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
   freshness, trends; ~2–3.5 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
   `coach workout <id>` (computed detail: peaks, recovery, drift, intervals). **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
   with per-minute HR; `json --raw` and **serve** also give the per-minute snapshot. The contract is in [COACH.md](COACH.md).
+- **serve**: a local HTTP JSON API on 127.0.0.1 for front ends (the TUI, a future bar widget): report,
+  status, live, sync and live actions. See [API.md](API.md); `contrib/systemd/whoop-api.service` runs it.
 
 ## Install (per user, no root)
 
@@ -74,7 +76,7 @@ uv run whoop-poc --demo       # synthetic night pinned to 2020-01-01, to preview
 uv run whoop-poc coach        # Coach summary, compact JSON (since <unix> | day <date> | workout <start>)
 uv run whoop-poc json         # the same summary, indented (--out FILE also writes daily/ next to FILE;
                               #   atomic, mode 600; --raw = per-minute snapshot@1 over --hours)
-uv run whoop-poc serve        # GET http://127.0.0.1:8787/v1/coach[?since=UNIX], /v1/snapshot?hours=24
+uv run whoop-poc serve        # local JSON API on http://127.0.0.1:8787/v1/ (API.md); the TUI uses it when it runs
 ```
 
 Options: `--db PATH` (default `~/src/noop/tools/linux-capture/captures/whoop.db`, or env `WHOOP_DB`),

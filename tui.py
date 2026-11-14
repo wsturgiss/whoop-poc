@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import statistics as st
 import sys
 import time
 from datetime import datetime
@@ -13,8 +12,10 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import DataTable, Footer, Header, Static
 
+import api
 import coach
 import whoop_poc as core
+from client import Client
 
 
 class Tile(Static):
@@ -120,7 +121,6 @@ class WhoopApp(App):
     def __init__(self, args, pool=None) -> None:
         super().__init__()
         self.args = args
-        self._pool = pool                       # report-builder worker process (see make_report_pool)
         self._frame = 0
         self._drain: dict | None = None
         self._was_draining = False
@@ -129,7 +129,12 @@ class WhoopApp(App):
         self._live_ours = False         # this TUI started it → stop it on quit (strap battery)
         self._live_stopping = None      # pid we asked to stop (it takes a few s to switch the stream off)
         self._live_drawn, self._live_drawn_at = False, 0.0
-        self._report: core.Report | None = None
+        self._report: dict | None = None          # the last /v1/report document
+        self._status: dict | None = None          # the last /v1/status document
+        self._live_doc: dict | None = None        # the last /v1/live document ...
+        self._live_s: list[tuple[int, int]] = []  # ... and the session's samples so far
+        self._threads = None
+        self._client = make_client(args, pool)
         self._building = self._rebuild = False
         self._exiting = False
         self._max_hr = core.max_hr_info()
@@ -177,15 +182,42 @@ class WhoopApp(App):
         if self._settings.get("theme") in self.available_themes:
             self.theme = self._settings["theme"]
         self.theme_changed_signal.subscribe(self, self.save_theme)
-        self._drain = None if self.args.demo else core.drain_status()
+        self.fetch_status()
         self.action_reload()
         self.set_interval(self.args.refresh, self.action_reload)
         self.poll_drain()
         self.set_interval(1.0, self.poll_drain)
         self.set_interval(0.1, self.animate_drain)
 
+    def fetch_status(self) -> None:
+        try:
+            self._status = self._client.get("/v1/status")
+        except api.ApiError:
+            self._status = None
+        self._drain = self._status["sync"]["progress"] if self._status else None
+
+    def fetch_live(self) -> None:
+        """The live session and its new samples (only the ones after the newest we have)."""
+        q = {"session": self._live_doc["session_start_unix"], "since": self._live_s[-1][0]} \
+            if self._live_s and self._live_doc else {}
+        try:
+            d = self._client.get("/v1/live", **q)
+        except api.ApiError:
+            return
+        new = [tuple(x) for x in d["samples"]]
+        self._live_s = new if d["full"] else self._live_s + new
+        self._live_doc, self._live = d, d["running"]
+
+    def post(self, path: str, **body) -> dict | None:
+        """POST an action; an error is shown as a notification and returns None."""
+        try:
+            return self._client.post(path, **body)
+        except api.ApiError as e:
+            self.notify(e.message, severity="warning" if e.code == 409 else "error")
+            return None
+
     def poll_drain(self) -> None:
-        self._drain = None if self.args.demo else core.drain_status()
+        self.fetch_status()
         if self._drain:
             self._was_draining = True
             if self._frame % 100 < 10:          # ~every 10 s while draining: show data as it lands
@@ -199,26 +231,30 @@ class WhoopApp(App):
     def action_live(self) -> None:
         if self._live or time.time() < self._live_pending:
             self._live_stopping = (self._live or {}).get("pid")
-            core.stop_live()
+            self.post("/v1/live/stop")
             self._live_pending, self._live_ours = 0.0, False
             self.notify("Live HR off")
-        else:
-            self.notify(core.start_live() + f" (auto-off after {core.LIVE_MINUTES} min)")
-            self._live_pending, self._live_ours = time.time() + 60, True
+        elif (d := self.post("/v1/live/start")) is not None:
+            self.notify(d["message"] + f" (auto-off after {d.get('minutes', core.LIVE_MINUTES):g} min)")
+            self._live_pending, self._live_ours = time.time() + 60, d["started"]
         self.render_live()
 
     def action_extend_live(self) -> None:
-        if core.extend_live():
+        try:
+            self._client.post("/v1/live/extend")
             self.notify("Live HR: +10 min")
-        else:
-            self.notify("Live HR isn't on (press l)", severity="warning")
+        except api.ApiError as e:
+            self.notify("Live HR isn't on (press l)" if e.code == 409 else e.message, severity="warning")
 
     async def action_quit(self) -> None:
         self._exiting = True
         if self._live_ours:                  # don't leave the strap streaming after we're gone
-            core.stop_live()
-        if self._pool is not None:           # don't wait for an in-flight build; the worker exits after it
-            self._pool.shutdown(wait=False, cancel_futures=True)
+            try:
+                self._client.post("/v1/live/stop")
+            except api.ApiError:
+                pass
+        if self._client.pool is not None:    # don't wait for an in-flight build; the worker exits after it
+            self._client.pool.shutdown(wait=False, cancel_futures=True)
         self.exit()
 
     def render_live(self) -> None:
@@ -226,11 +262,11 @@ class WhoopApp(App):
         head, chart, key = (self.query_one(f"#live-{i}", Static) for i in ("head", "chart", "key"))
         pending = time.time() < self._live_pending
         if not d and not pending:
-            last = None if self.args.demo else core.last_live()
+            last = (self._live_doc or {}).get("last")
             # After a session ends, keep its graph up for review (until the next one, or 12 h).
             if last and last.get("state") == "ended" and time.time() - (last.get("unix") or 0) < 12 * 3600:
                 if self._render_live_graph(last, chart, key, ended=True):
-                    s = core.live_samples()
+                    s = self._live_s
                     bpms = [b for _, b in s]
                     head.update(f"[b]LAST LIVE SESSION[/]  {core.hhmm(s[0][0])} → {core.hhmm(s[-1][0])} · "
                                 f"{core.dur((s[-1][0] - s[0][0]) // 60)} · avg [b]{sum(bpms) / len(bpms):.0f}[/] · "
@@ -275,7 +311,7 @@ class WhoopApp(App):
         """Draw the session graph + zone key; True if there was enough data to draw."""
         if self._live_drawn and time.time() - self._live_drawn_at < 1.0:   # ~1/s; the heart animates faster
             return True
-        s = core.live_samples()
+        s = self._live_s
         self._live_drawn_at = time.time()
         if len(s) < 2:
             chart.update(""); key.update("")
@@ -289,7 +325,7 @@ class WhoopApp(App):
 
     def animate_drain(self) -> None:
         if self._frame % 3 == 0:
-            self._live = None if self.args.demo else core.live_status()
+            self.fetch_live()
             if self._live:
                 self._live_pending = 0.0
             elif self._live_ours and time.time() >= self._live_pending:
@@ -316,25 +352,19 @@ class WhoopApp(App):
         w.display = True
 
     def action_reload(self) -> None:
-        """Rebuild the report in a persistent worker process (0.3–4 s of decoding + NOOP's stager). A
-        thread wasn't enough: the decoding holds Python's GIL and stalled the UI up to ~0.9 s. The worker
-        keeps its stager cache between reloads. Requests during a build coalesce into one more build."""
+        """Fetch /v1/report on a thread. The client asks the API server, or builds it in the persistent
+        worker process (0.3–4 s of decoding + NOOP's stager; a thread wasn't enough, the decoding holds
+        Python's GIL and stalled the UI up to ~0.9 s). Requests during a build coalesce into one more."""
         if self._building:
             self._rebuild = True
             return
         self._building, self._rebuild = True, False
         hours = self.args.hours
         self.render_meta_loading()
-        args = (coach.report_with_workouts, self.args.db, hours, self.args.address)
-        try:
-            fut = self._pool.submit(*args, demo=self.args.demo) if self._pool else None
-        except Exception:                       # worker died / pool broken: fall back to a thread
-            self._pool = None
-            fut = None
-        if fut is None:
+        if self._threads is None:
             from concurrent.futures import ThreadPoolExecutor
-            self._threads = getattr(self, "_threads", None) or ThreadPoolExecutor(1)
-            fut = self._threads.submit(*args, demo=self.args.demo)
+            self._threads = ThreadPoolExecutor(1)
+        fut = self._threads.submit(self._client.get, "/v1/report", hours=hours, bins=self.chart_cols())
 
         def done(f) -> None:                    # runs on the pool's thread: hand back to the UI
             if self._exiting or not self.is_running or f.cancelled():
@@ -353,7 +383,7 @@ class WhoopApp(App):
     def _report_ready(self, r, hours) -> None:
         self._building = False
         if isinstance(r, BaseException):
-            self.notify(f"Reload failed: {r}", severity="error")
+            self.notify(f"Reload failed: {getattr(r, 'message', r)}", severity="error")
         elif hours == self.args.hours:          # drop a result for a window the user already left
             self._report = r
             self.render_report(r)
@@ -361,7 +391,8 @@ class WhoopApp(App):
             self.action_reload()
 
     def render_meta_loading(self) -> None:
-        if getattr(self, "_report", None) is None or self._report.until - self._report.since != int(self.args.hours * 3600):
+        win = (self._report or {}).get("window")
+        if not win or win["until_unix"] - win["since_unix"] != int(self.args.hours * 3600):
             self.query_one("#meta", Static).update(
                 f"[b]loading last {core.dur(int(self.args.hours * 60)).replace(' 00m', '')}…[/]")
 
@@ -370,14 +401,18 @@ class WhoopApp(App):
         # instead of wrapping until the next auto-reload.
         # self.size still holds the old width while this handler runs: redraw after the refresh.
         if getattr(self, "_report", None) is not None:
-            self.call_after_refresh(self.render_report, self._report)
+            self.call_after_refresh(self._redraw_resized)
         self._live_drawn = False
+
+    def _redraw_resized(self) -> None:
+        self.render_report(self._report)
+        if self._report["hr"]["series"]["bins"] != self.chart_cols():   # sliced for the old chart width
+            self.action_reload()
 
     def action_sync(self) -> None:
         # Never own the drain: it can run 20 min, and q must quit immediately. The banner tracks it.
-        ok, msg = core.start_sync_background()
-        self.notify(msg + (" (strap must be near the laptop)" if ok else ""),
-                    severity="information" if ok else "error")
+        if (d := self.post("/v1/sync")) is not None:
+            self.notify(d["message"] + " (strap must be near the laptop)")
         self.poll_drain()
 
     def action_window(self) -> None:
@@ -386,43 +421,49 @@ class WhoopApp(App):
         self.notify(f"Window: last {core.dur(int(self.args.hours * 60)).replace(' 00m', '')}")
         self.action_reload()
 
-    def render_report(self, r: core.Report) -> None:
-        self._max_hr = core.refresh_max_hr()       # the report worker may have raised the observed peak
-        self.sub_title = r.meta.get("name") or r.meta["address"]
-        self.query_one("#meta", Static).update(
-            f"window: last {(r.until - r.since) // 3600}h [dim](w to change)[/] · newest data "
-            f"{core.stamp(r.meta.get('newest_unix') or 0)}"
-            f"{' (' + core.ago(r.meta['newest_unix']) + ')' if r.meta.get('newest_unix') else ''} · "
-            f"auto-reload {self.args.refresh}s · "
-            f"times in {datetime.now().astimezone().tzname()}")
+    def chart_cols(self) -> int:
+        """Bar columns in the HR chart (its width less the 4-character bpm labels): /v1/report's bins."""
+        return max(20, self.size.width - 6) - 4
 
-        b, bt = (None if self.args.demo else core.last_battery()), self.query_one("#t-batt", Tile)
+    def render_report(self, doc: dict) -> None:
+        self._max_hr = doc["max_hr"]
+        core.MAX_HR = doc["max_hr"]["max_hr"]     # zone colors and ranges follow the report's max_hr
+        since, until = doc["window"]["since_unix"], doc["window"]["until_unix"]
+        newest = doc["newest_unix"]
+        self.sub_title = doc["device"]["name"] or doc["device"]["address"]
+        via = f" · [dim]via API :{self._client.port}[/]" if self._client.mode == "api" else ""
+        self.query_one("#meta", Static).update(
+            f"window: last {(until - since) // 3600}h [dim](w to change)[/] · newest data "
+            f"{core.stamp(newest or 0)}"
+            f"{' (' + core.ago(newest) + ')' if newest else ''} · "
+            f"auto-reload {self.args.refresh}s · "
+            f"times in {datetime.now().astimezone().tzname()}{via}")
+
+        b, bt = (self._status or {}).get("battery"), self.query_one("#t-batt", Tile)
         if b:
             color = "red" if b["pct"] <= 15 else "yellow" if b["pct"] <= 30 else "green"
             bt.show("STRAP BATTERY", f"[{color}]{b['pct']}%[/]", f"read {core.ago(b['unix'])}")
         else:
             bt.show("STRAP BATTERY", "—", "read after next sync")
 
-        now, stats, hm = r.hr_now, r.hr_stats(), r.hr_minutes
+        hr = doc["hr"]
+        now, stats, series = hr["latest"], hr["stats"], hr["series"]
         t = {k: self.query_one(f"#t-{k}", Tile) for k in ("now", "rest", "range", "worn")}
         chart, axis, key = (self.query_one(f"#hr-{i}", Static) for i in ("chart", "axis", "key"))
         if now and stats:
-            t["now"].show("♥ LATEST", f"[red]{now.hr}[/] bpm", f"{core.hhmm(now.unix)} · {core.ago(now.unix)}")
+            t["now"].show("♥ LATEST", f"[red]{now['bpm']}[/] bpm", f"{core.hhmm(now['unix'])} · {core.ago(now['unix'])}")
             t["rest"].show("RESTING ≈", f"{stats['rest']:.0f} bpm", "5th pct, still minutes")
             t["range"].show("RANGE", f"{stats['min']:.0f}–{stats['max']:.0f} bpm", f"avg {stats['avg']:.0f}")
-            t["worn"].show("WORN", core.dur(stats["worn_min"]), f"last {(r.until - r.since) // 3600}h")
-            # Time-true: each minute sits at its real time (gaps = strap off), columns show the peak of
+            t["worn"].show("WORN", core.dur(stats["worn_min"]), f"last {(until - since) // 3600}h")
+            # Time-true: each point sits at its real time (gaps = strap off), columns show the peak of
             # their slice (a 30-min run must not average away at 7d), bars colored by HR zone.
             width = max(20, self.size.width - 6)
-            rows = core.zone_chart([(m.t, m.hr) for m in hm], width, 6, t0=r.since, t1=r.until,
+            rows = core.zone_chart([tuple(p) for p in series["points"]], width, 6, t0=since, t1=until,
                                    agg="max", gap_fill_s=61)
-            ticks, labels = core.time_axis(r.since, r.until, width - 4)
+            ticks, labels = core.time_axis(since, until, width - 4)
             chart.update("\n".join(rows + [f"[dim]    {ticks}\n    {labels}[/]"]))
-            axis.update(f"per-minute HR, peak per column  ({min(m.hr for m in hm):.0f}–{max(m.hr for m in hm):.0f} bpm)")
-            secs = {z[0]: 0 for z in (core.REST_ZONE,) + core.ZONES}
-            for m in hm:
-                secs[core.hr_zone(m.hr)[0]] += 60
-            key.update(self.zone_key(secs))
+            axis.update(f"per-minute HR, peak per column  ({stats['min']:.0f}–{stats['max']:.0f} bpm)")
+            key.update(self.zone_key(hr["zone_sec"]))
         else:
             for k in t:
                 t[k].show(k.upper(), "—", "")
@@ -434,32 +475,32 @@ class WhoopApp(App):
                         "no heart-rate data in this window: wear the strap, then press s to sync"
                         if not self._drain else "nothing in this window yet: waiting for the drain to start")
 
-        self.render_workouts(r)
-        staged = r.meta.get("sleep_source") == "noop"
-        self.query_one("#sleep-head", Static).update(
-            f"SLEEP  [dim]{core.SLEEP_SOURCE_LABEL[r.meta.get('sleep_source', 'heuristic')]}[/]")
+        self.render_workouts(doc["workouts"])
+        sl = doc["sleep"]
+        staged = sl["source"] == "noop"
+        self.query_one("#sleep-head", Static).update(f"SLEEP  [dim]{core.SLEEP_SOURCE_LABEL[sl['source']]}[/]")
         table = self.query_one("#sleep-table", DataTable)
         table.clear(columns=True)
         table.add_columns("Window", "In bed", "Asleep ≈", "Eff.", "Avg HR", "Low HR",
                           *(("Deep", "Light", "REM", "Wake", "Rest HR", "HRV") if staged else ()))
         note, hyp, legend = (self.query_one(f"#{i}", Static) for i in ("sleep-note", "hypno", "hypno-legend"))
-        if not r.sleep:
-            note.update(core.no_sleep_msg(r))
+        if not sl["sessions"]:
+            note.update(sl["note"])
             hyp.update("")
             legend.update("")
             table.display = False
             return
         note.update("")
         table.display = True
-        for s in reversed(r.sleep):
-            hrs = s.hrs
-            table.add_row(f"{core.stamp(s.start)} → {core.hhmm(s.end)}", core.dur(s.span_min),
-                          core.dur(s.asleep_min), f"{100 * s.asleep_min / max(1, s.span_min):.0f}%",
-                          f"{st.mean(hrs):.0f}" if hrs else "—", f"{min(hrs):.0f}" if hrs else "—",
-                          *((*(core.dur(v) for v in (lambda m: (m["deep"], m["light"], m["rem"], m["wake"]))(
-                              s.stage_minutes())), str(s.resting_hr or "—"),
-                             f"{s.avg_hrv:.0f} ms" if s.avg_hrv else "—") if staged else ()))
-        last = r.sleep[-1]
+        for s in reversed(sl["sessions"]):
+            sm = s["stage_min"] or {k: 0 for k in core.STAGES}
+            table.add_row(f"{core.stamp(s['start_unix'])} → {core.hhmm(s['end_unix'])}", core.dur(s["in_bed_min"]),
+                          core.dur(s["asleep_min"]), f"{100 * s['asleep_min'] / max(1, s['in_bed_min']):.0f}%",
+                          "—" if s["avg_hr"] is None else f"{s['avg_hr']:.0f}",
+                          "—" if s["low_hr"] is None else f"{s['low_hr']:.0f}",
+                          *((*(core.dur(sm[k]) for k in ("deep", "light", "rem", "wake")), str(s["resting_hr"] or "—"),
+                             f"{s['avg_hrv_ms']:.0f} ms" if s["avg_hrv_ms"] else "—") if staged else ()))
+        last = api.sleep_window(sl["last"])
         width = max(20, self.size.width - 8)
         if staged:
             bar = core.stage_bar(last, width, markup=True)
@@ -476,9 +517,7 @@ class WhoopApp(App):
                    f"{core.sleep_hours(last)}\n{bar}\n[dim]{ticks}[/]\n{labels}")
         legend.update(legend_txt)
 
-
-    def render_workouts(self, r: core.Report) -> None:
-        xs = r.meta.get("workouts", [])
+    def render_workouts(self, xs: list[dict]) -> None:
         self.query_one("#workout-head", Static).update(
             "WORKOUTS  [dim](detected from elevated HR; confirm: whoop-poc coach confirm <id> --minutes N)[/]")
         note, last = self.query_one("#workout-note", Static), self.query_one("#workout-last", Static)
@@ -497,6 +536,17 @@ class WhoopApp(App):
         for x in reversed(xs):
             table.add_row(x["id"], workout_status(x), core.dur(x["duration_min"]), str(x["avg_hr"]),
                           str(x["max_hr"]), str(x["peak_hr_5s"] or "—"), zones_text(x["zone_min"]), recovery_text(x["recovery"]))
+
+
+def make_client(args, pool=None) -> Client:
+    """The TUI's API client. A run the shared server doesn't serve (--demo, another --db, --address,
+    --max-hr) stays in-process."""
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(db=args.db, address=args.address, demo=args.demo, heuristic=False,
+                          days=getattr(args, "days", coach.COACH_DAYS))
+    shared = not (args.demo or args.address or getattr(args, "max_hr", None) is not None
+                  or Path(args.db).expanduser().resolve() != core.DEFAULT_DB.resolve())
+    return Client(cfg, api.port(args), pool, use_api=shared)
 
 
 def make_report_pool():

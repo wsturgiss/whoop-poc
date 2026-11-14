@@ -1,0 +1,14 @@
+[Unit]
+Description=whoop-poc local JSON API on 127.0.0.1 (see API.md)
+
+[Service]
+Type=simple
+# Port: WHOOP_API_PORT in ~/.config/whoop-poc/env (whoop-poc reads that file itself), default 8787.
+# It binds 127.0.0.1 only and reads whoop.db read-only; syncs and live sessions it starts are detached.
+ExecStart=%h/.local/bin/whoop-poc serve
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

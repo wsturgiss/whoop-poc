@@ -163,6 +163,23 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
                  "labels": labels}
 
 
+def newest_unix(db: Path, address: str | None = None) -> int | None:
+    """Unix time of the newest history frame in whoop.db (read-only), or None if there is none."""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
+                           + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
+        return dev and conn.execute("SELECT max(unix) FROM frames WHERE device_id=? AND inner_type=?",
+                                    (dev[0], TYPE_HISTORICAL)).fetchone()[0]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 def per_minute(samples: list[Sample]) -> list[Minute]:
     buckets: dict[int, list[tuple[int, float]]] = {}
     prev = None
@@ -1096,47 +1113,9 @@ def write_json(path: Path, doc: dict, compact: bool = False) -> None:
 
 
 def run_serve(args) -> None:
-    """Tiny localhost-only JSON endpoint: GET /v1/coach[?since=UNIX] (snapshot@3), GET /v1/snapshot[?hours=N]
-    (per-minute snapshot@1), GET /healthz."""
-    import json
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import parse_qs, urlparse
-
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            u = urlparse(self.path)
-            if u.path == "/healthz":
-                code, doc = 200, {"ok": True}
-            elif u.path == "/v1/coach":
-                import coach
-                try:
-                    q = parse_qs(u.query)
-                    doc, code = coach.run(args, ["since", q["since"][0]] if "since" in q else [])
-                    code = 200 if code == 0 else 400
-                except (ValueError, SystemExit) as e:
-                    code, doc = 400, {"error": str(e)}
-            elif u.path == "/v1/snapshot":
-                try:
-                    hours = float(parse_qs(u.query).get("hours", [args.hours])[0])
-                    doc = snapshot(build_report(args.db, hours, args.address, demo=args.demo, heuristic=args.heuristic))
-                    code = 200
-                except (ValueError, SystemExit) as e:
-                    code, doc = 400, {"error": str(e)}
-            else:
-                code, doc = 404, {"error": "try /v1/coach or /v1/snapshot"}
-            body = json.dumps(doc, separators=(",", ":")).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *_):
-            pass
-
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), H)
-    print(f"serving http://127.0.0.1:{args.port}/v1/coach and /v1/snapshot", flush=True)
-    srv.serve_forever()
+    """`whoop-poc serve`: the local JSON API (api.py, API.md)."""
+    import api
+    api.serve(args)
 
 
 # ------------------------------------------------------------------------------------------ sync
@@ -1200,7 +1179,8 @@ def main(argv=None) -> None:
     p.add_argument("--refresh", type=int, default=30, help="TUI reload / html --watch interval, seconds")
     p.add_argument("--out", default=None, help="html: output path (default out/whoop.html); json: write here "
                    "atomically instead of stdout, and refresh the daily/ archive next to it")
-    p.add_argument("--port", type=int, default=8787, help="serve: localhost port (default 8787)")
+    p.add_argument("--port", type=int, help="serve / tui: API port on 127.0.0.1 (default WHOOP_API_PORT or 8787)")
+    p.add_argument("--host", default="127.0.0.1", help="serve: bind address; only 127.0.0.1 / localhost are accepted")
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
     p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")
