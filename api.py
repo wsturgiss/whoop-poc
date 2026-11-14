@@ -1,23 +1,30 @@
-"""Local HTTP JSON API for whoop-poc front ends: the Textual TUI now, an Omarchy bar widget later.
+"""Local HTTP JSON API for whoop-poc front ends: the Textual TUI, the Omarchy bar widget, light-training.
 
-`whoop-poc serve` binds 127.0.0.1 only (port: --port, else WHOOP_API_PORT, else 8787). Every request goes
-through dispatch(), and client.py's in-process fallback calls the same dispatch(), so a front end gets
+`whoop-poc serve` binds 127.0.0.1 by default (port: --port, else WHOOP_API_PORT, else 8787). Every request
+goes through dispatch(), and client.py's in-process fallback calls the same dispatch(), so a front end gets
 the same documents whether the server is running or not. Endpoints and shapes are in API.md.
 
-Requests are local-only: the Host header must name 127.0.0.1 or localhost (blocks DNS rebinding), and a
-POST must send Content-Type: application/json (a cross-site page can't, without a CORS preflight this
-server never answers). There is no other auth.
+Local requests: the Host header must name 127.0.0.1 or localhost (blocks DNS rebinding), and a POST must
+send Content-Type: application/json (a cross-site page can't, without a CORS preflight this server never
+answers). They need no token.
+
+`--host` with any other address (LAN mode) needs WHOOP_API_TOKEN set. A request that isn't local (peer or
+Host header not loopback) must then send `Authorization: Bearer <WHOOP_API_TOKEN>`, and may only GET.
 """
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import math
+import os
 import sys
 import time
 from datetime import datetime
 
 import coach
 import whoop_poc as w
+import workout_detail as wd
 
 HOST = "127.0.0.1"
 LOCAL_HOSTS = ("127.0.0.1", "localhost")
@@ -25,10 +32,16 @@ DEFAULT_PORT = 8787
 REPORT_SCHEMA = "whoop-poc/report@1"
 STATUS_SCHEMA = "whoop-poc/status@1"
 LIVE_SCHEMA = "whoop-poc/live@1"
+HR_WINDOW_SCHEMA = "whoop-poc/hr-window@1"
+WORKOUTS_SCHEMA = "whoop-poc/workouts@1"
 REPORT_BINS = 480          # /v1/report HR series: peaks of this many slices by default ...
 MAX_BINS = 4000            # ... and at most this many when asked (?bins=, a chart's column count)
 MAX_HOURS = 24 * 31
 LIVE_MAX_MINUTES = 180     # whoop_live.py caps a session at 3 h
+HR_WINDOW_MAX_S = 24 * 3600          # /v1/hr: longest window
+WORKOUTS_DEFAULT_S = 7 * 86400       # /v1/workouts: default window ...
+WORKOUTS_MAX_S = 31 * 86400          # ... and longest
+TOKEN_MIN_LEN = 24                   # WHOOP_API_TOKEN: shortest accepted (secrets.token_urlsafe(32) is 43)
 
 
 class ApiError(Exception):
@@ -41,7 +54,6 @@ class ApiError(Exception):
 
 def port(args=None) -> int:
     """--port if given, else WHOOP_API_PORT (environment or ~/.config/whoop-poc/env), else 8787."""
-    import os
     p = getattr(args, "port", None)
     if p is not None:
         return int(p)
@@ -51,6 +63,37 @@ def port(args=None) -> int:
     if not v.isdigit() or not 0 < int(v) < 65536:
         raise SystemExit("WHOOP_API_PORT must be a port number")
     return int(v)
+
+
+def token() -> str | None:
+    """WHOOP_API_TOKEN (environment or ~/.config/whoop-poc/env), or None when unset or blank."""
+    return os.environ.get("WHOOP_API_TOKEN", "").strip() or None
+
+
+def check_bind(host: str, tok: str | None) -> None:
+    """Refuse (SystemExit) a non-loopback bind without a usable token. Never prints the token."""
+    if host in LOCAL_HOSTS:
+        return
+    if not host:
+        raise SystemExit("--host must name an address (127.0.0.1, 0.0.0.0, or this machine's LAN address)")
+    if tok is None:
+        raise SystemExit(f"--host {host} serves the LAN: set WHOOP_API_TOKEN first (see API.md, \"LAN mode\")")
+    if len(tok) < TOKEN_MIN_LEN:
+        raise SystemExit(f"WHOOP_API_TOKEN is too short for LAN mode (at least {TOKEN_MIN_LEN} characters)")
+
+
+def is_local(peer: str, host_hdr: str) -> bool:
+    """A request from this machine to a loopback name: no token needed."""
+    try:
+        loop = ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        loop = False
+    return loop and host_hdr in LOCAL_HOSTS
+
+
+def bearer_ok(header: str | None, tok: str) -> bool:
+    scheme, _, given = (header or "").partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(given.strip().encode(), tok.encode())
 
 
 def _num(q: dict, key: str, default, lo, hi, cast=float):
@@ -160,12 +203,17 @@ def sleep_window(last: dict) -> w.SleepWindow:
     return w.SleepWindow(last["start_unix"], last["end_unix"], mins)
 
 
+def zone_sec(mins: list[w.Minute]) -> dict[str, int]:
+    """Worn minutes × 60 per zone, every zone Z0..Z5 present (a minute's zone is its mean HR's)."""
+    out = {z[0]: 0 for z in (w.REST_ZONE,) + w.ZONES}
+    for m in mins:
+        out[w.hr_zone(m.hr)[0]] += 60
+    return out
+
+
 def report_doc(r: w.Report, bins: int = REPORT_BINS, per_minute: bool = False) -> dict:
     """What the TUI window shows, from coach.report_with_workouts' Report."""
     stats, now = r.hr_stats(), r.hr_now
-    zone_sec = {z[0]: 0 for z in (w.REST_ZONE,) + w.ZONES}
-    for m in r.hr_minutes:
-        zone_sec[w.hr_zone(m.hr)[0]] += 60
     info = w.max_hr_info()
     return {
         "schema": REPORT_SCHEMA, "demo": r.meta.get("address") == "-",
@@ -174,7 +222,7 @@ def report_doc(r: w.Report, bins: int = REPORT_BINS, per_minute: bool = False) -
         "newest_unix": r.meta.get("newest_unix"),
         "hr": {"latest": None if now is None else {"unix": now.unix, "bpm": now.hr},
                "stats": None if not stats else {k: round(v, 2) for k, v in stats.items()},
-               "zone_sec": zone_sec, "series": hr_series(r, bins, per_minute)},
+               "zone_sec": zone_sec(r.hr_minutes), "series": hr_series(r, bins, per_minute)},
         "zones": coach.zones(),
         "max_hr": {**info, "text": w.max_hr_text(info)},
         "sleep": sleep_doc(r),
@@ -191,6 +239,70 @@ def report(cfg, q: dict, body: dict) -> tuple[int, dict]:
         raise ApiError(400, "series is bins or minute")
     r = coach.report_with_workouts(cfg.db, hours, cfg.address, demo=cfg.demo, heuristic=cfg.heuristic)
     return 200, report_doc(r, bins, q.get("series") == "minute")
+
+
+def _window(cfg, q: dict, default_s: int, max_s: int) -> tuple[int, int]:
+    """?since=UNIX&until=UNIX: until defaults to now (the demo night's end with --demo), since to
+    until - default_s. since < until, and the window at most max_s long."""
+    until = _num(q, "until", w.DEMO_END if cfg.demo else int(time.time()), 0, 2 ** 40, int)
+    since = _num(q, "since", until - default_s, 0, 2 ** 40, int)
+    if since >= until:
+        raise ApiError(400, "since must be before until")
+    if until - since > max_s:
+        raise ApiError(400, f"the window is at most {max_s // 3600} hours")
+    return since, until
+
+
+def _load(cfg, since: int, until: int) -> w.Report:
+    """coach.report_with_workouts over [since, until] (sleep by the cheap heuristic: neither endpoint
+    reports sleep)."""
+    hours = (until - since + 1) / 3600           # build_report truncates to whole seconds
+    return coach.report_with_workouts(cfg.db, hours, cfg.address, now=until, demo=cfg.demo, heuristic=True)
+
+
+def _covered(r: w.Report, until: int) -> bool:
+    """whoop.db holds data up to the window's end, so a later sync won't add to it."""
+    newest = r.meta.get("newest_unix")
+    return newest is not None and newest >= until
+
+
+def hr_window(cfg, q: dict, body: dict) -> tuple[int, dict]:
+    """HR over one window, ?since=UNIX&until=UNIX (at most 24 h): stats over its worn 1-minute means,
+    5-s and 1-s peaks, and time per zone. For a front end that knows when its own session ran."""
+    since, until = _window(cfg, q, 3600, HR_WINDOW_MAX_S)
+    r = w.build_report(cfg.db, (until - since + 1) / 3600, cfg.address, now=until, demo=cfg.demo, heuristic=True)
+    mins = [m for m in r.hr_minutes if since <= m.t < until]
+    secs = wd.hr_seconds(r.samples, since, until)
+    stats = w.minute_stats(mins)
+    return 200, {
+        "schema": HR_WINDOW_SCHEMA, "demo": bool(cfg.demo),
+        "window": {"since_unix": since, "until_unix": until},
+        "newest_unix": r.meta.get("newest_unix"), "covered": _covered(r, until),
+        "hr": {"stats": None if not stats else {k: round(v, 2) for k, v in stats.items()},
+               "peak_hr_5s": wd.peak_5s(secs), "peak_hr_1s": max(secs.values(), default=None),
+               "zone_sec": zone_sec(mins)},
+        "zones": coach.zones(),
+    }
+
+
+def workouts(cfg, q: dict, body: dict) -> tuple[int, dict]:
+    """Detected workouts (high-HR periods, as coach and the TUI find them, with confirmations applied)
+    starting in ?since=UNIX&until=UNIX (default the last 7 days, at most 31), oldest first, each with
+    its stats and time per zone."""
+    since, until = _window(cfg, q, WORKOUTS_DEFAULT_S, WORKOUTS_MAX_S)
+    r = _load(cfg, since, until)
+    rows = []
+    for x in r.meta.get("workouts", []):
+        if not since <= x["start_unix"] < until:
+            continue
+        mins = [m for m in r.hr_minutes if x["start_unix"] <= m.t < x["end_unix"]]
+        rows.append({**x, "zone_sec": zone_sec(mins)})
+    return 200, {
+        "schema": WORKOUTS_SCHEMA, "demo": bool(cfg.demo),
+        "window": {"since_unix": since, "until_unix": until},
+        "newest_unix": r.meta.get("newest_unix"), "covered": _covered(r, until),
+        "workouts": rows, "zones": coach.zones(),
+    }
 
 
 def live(cfg, q: dict, body: dict) -> tuple[int, dict]:
@@ -251,6 +363,8 @@ ROUTES = {
     ("GET", "/v1/snapshot"): (snapshot, True),
     ("GET", "/v1/report"): (report, True),
     ("GET", "/v1/live"): (live, False),
+    ("GET", "/v1/hr"): (hr_window, True),
+    ("GET", "/v1/workouts"): (workouts, True),
     ("POST", "/v1/sync"): (sync_start, False),
     ("POST", "/v1/live/start"): (live_start, False),
     ("POST", "/v1/live/extend"): (live_extend, False),
@@ -278,14 +392,15 @@ def dispatch(cfg, method: str, path: str, query: dict | None = None, body: dict 
 
 
 # --------------------------------------------------------------------------------------- server
-def make_server(cfg, host: str = HOST, port_: int = DEFAULT_PORT, pool=None, log=None):
-    """A ThreadingHTTPServer on host:port_ (127.0.0.1 / localhost only) serving dispatch(). pool (a one-
+def make_server(cfg, host: str = HOST, port_: int = DEFAULT_PORT, pool=None, log=None, tok: str | None = None):
+    """A ThreadingHTTPServer on host:port_ serving dispatch(). A host other than 127.0.0.1 / localhost
+    needs tok (WHOOP_API_TOKEN), which non-local requests must then send as a bearer token. pool (a one-
     worker ProcessPoolExecutor) runs the heavy handlers; None runs them in the request thread."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qsl, urlsplit
 
-    if host not in LOCAL_HOSTS:
-        raise SystemExit(f"whoop-poc serve binds 127.0.0.1 only; refusing {host!r}")
+    check_bind(host, tok)
+    lan = host not in LOCAL_HOSTS
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -296,6 +411,8 @@ def make_server(cfg, host: str = HOST, port_: int = DEFAULT_PORT, pool=None, log
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if code == 401:
+                self.send_header("WWW-Authenticate", 'Bearer realm="whoop-poc"')
             self.end_headers()
             self.wfile.write(body)
 
@@ -309,8 +426,13 @@ def make_server(cfg, host: str = HOST, port_: int = DEFAULT_PORT, pool=None, log
 
         def _route(self, method: str, path: str, query: dict) -> tuple[int, dict]:
             host_hdr = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-            if host_hdr not in LOCAL_HOSTS:
-                return 403, {"error": "Host must be 127.0.0.1 or localhost"}
+            if not is_local(self.client_address[0], host_hdr):
+                if not lan:
+                    return 403, {"error": "Host must be 127.0.0.1 or localhost"}
+                if not bearer_ok(self.headers.get("Authorization"), tok):
+                    return 401, {"error": "needs Authorization: Bearer <WHOOP_API_TOKEN>"}
+                if method != "GET":
+                    return 403, {"error": "actions are local only; the LAN can only GET"}
             body: dict = {}
             if method == "POST":
                 if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
@@ -350,17 +472,20 @@ def serve(args) -> None:
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
-    host = getattr(args, "host", None) or HOST
+    host = getattr(args, "host", None)
+    host = HOST if host is None else host
     p = port(args)
-    if host not in LOCAL_HOSTS:          # before the worker starts
-        raise SystemExit(f"whoop-poc serve binds 127.0.0.1 only; refusing {host!r}")
+    tok = token() if host not in LOCAL_HOSTS else None
+    check_bind(host, tok)                # before the worker starts
     pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
     try:
-        srv = make_server(args, host, p, pool, log=lambda m: print(m, file=sys.stderr, flush=True))
+        srv = make_server(args, host, p, pool, log=lambda m: print(m, file=sys.stderr, flush=True), tok=tok)
     except OSError as e:
         pool.shutdown(wait=False)
-        raise SystemExit(f"can't listen on {HOST}:{p}: {e.strerror}") from None
-    print(f"whoop-poc API on http://{HOST}:{p}/v1/ (see API.md) since "
+        raise SystemExit(f"can't listen on {host}:{p}: {e.strerror}") from None
+    shown = HOST if host == "localhost" else host
+    mode = " (LAN mode: other machines need the bearer token and can only GET)" if tok else ""
+    print(f"whoop-poc API on http://{shown}:{p}/v1/{mode} (see API.md) since "
           f"{datetime.now().strftime('%H:%M:%S')}", flush=True)
     try:
         srv.serve_forever()

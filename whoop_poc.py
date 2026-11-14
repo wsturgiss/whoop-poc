@@ -8,7 +8,7 @@ decodes WHOOP 4.0 type-47 HISTORICAL_DATA records (v12/v24 layout), and shows:
   * sleep: windows detected by a simple motion + HR heuristic (NOT WHOOP's sleep staging)
 
 Subcommands:  tui (default) | summary | html | coach (Coach summary + drill-downs, coach.py) |
-              json (writes coach.json + daily archive; --raw = per-minute snapshot@1) | serve (localhost JSON)
+              json (writes coach.json + daily archive; --raw = per-minute snapshot@1) | serve (JSON API; localhost, or the LAN with a token)
 Core + HTML are stdlib only; the TUI (tui.py) uses Textual. Does no BLE itself; `--sync` shells out to `whoop-sync` / linux-capture's whoop_sync.py.
 """
 from __future__ import annotations
@@ -1179,8 +1179,9 @@ def main(argv=None) -> None:
     p.add_argument("--refresh", type=int, default=30, help="TUI reload / html --watch interval, seconds")
     p.add_argument("--out", default=None, help="html: output path (default out/whoop.html); json: write here "
                    "atomically instead of stdout, and refresh the daily/ archive next to it")
-    p.add_argument("--port", type=int, help="serve / tui: API port on 127.0.0.1 (default WHOOP_API_PORT or 8787)")
-    p.add_argument("--host", default="127.0.0.1", help="serve: bind address; only 127.0.0.1 / localhost are accepted")
+    p.add_argument("--port", type=int, help="serve / tui: API port (default WHOOP_API_PORT or 8787)")
+    p.add_argument("--host", default="127.0.0.1", help="serve: bind address (default 127.0.0.1); any other address (e.g. 0.0.0.0) "
+                   "needs WHOOP_API_TOKEN and serves bearer-authenticated GETs to the LAN")
     p.add_argument("--watch", action="store_true", help="html: regenerate every --refresh seconds")
     p.add_argument("--heuristic", action="store_true", help="skip NOOP's SleepStager; use the simple heuristic")
     p.add_argument("--demo", action="store_true", help="use a synthetic night instead of the DB (shows the sleep view)")

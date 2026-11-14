@@ -1,7 +1,8 @@
 # whoop-poc local API
 
-A small HTTP JSON API for whoop-poc front ends: the Textual TUI and the Omarchy bar widget
-(`contrib/omarchy/wsturgiss.whoop`, [PLUGIN.md](PLUGIN.md)). HTTP rather than a unix socket because QML's `XMLHttpRequest` speaks HTTP only.
+A small HTTP JSON API for whoop-poc front ends: the Textual TUI, the Omarchy bar widget
+(`contrib/omarchy/wsturgiss.whoop`, [PLUGIN.md](PLUGIN.md)), and light-training on the Light Phone, which
+reads it over home Wi-Fi in [LAN mode](#lan-mode). HTTP rather than a unix socket because QML's `XMLHttpRequest` speaks HTTP only.
 
 `coach.json` stays the Coach contract ([COACH.md](COACH.md)); `/v1/summary` serves the same document,
 built fresh, as an additional reader.
@@ -14,19 +15,23 @@ whoop-poc serve --port 8790
 systemctl --user start whoop-api   # the unit below
 ```
 
-- **Bind:** `127.0.0.1` only. `--host` accepts only `127.0.0.1` or `localhost`; anything else
-  (`0.0.0.0`, `::`, a LAN address) refuses to start.
+- **Bind:** `127.0.0.1` by default. `--host` with any other IPv4 address (`0.0.0.0`, a LAN address) is
+  [LAN mode](#lan-mode), which refuses to start without `WHOOP_API_TOKEN`.
 - **Port:** `--port` if passed, else `WHOOP_API_PORT` (environment, then `~/.config/whoop-poc/env`),
   else **8787**. The TUI resolves its port the same way.
-- **Auth:** none beyond the loopback bind. Two checks keep other origins out:
-  - the `Host` header must be `127.0.0.1` or `localhost` (with any port), otherwise `403`; this blocks
-    DNS rebinding;
+- **Auth:** local requests need none. A request is local when it comes from a loopback address *and*
+  its `Host` names `127.0.0.1` or `localhost`. Two checks keep other origins out:
+  - the `Host` header must be `127.0.0.1` or `localhost` (with any port), otherwise `403` (in LAN mode,
+    `401` without the token); this blocks DNS rebinding;
   - a POST must send `Content-Type: application/json`, otherwise `415`. A web page on another origin
     can't send that without a CORS preflight, and the server sends no CORS headers, so a browser tab
     can't start a sync or a live session.
+
+  Requests that aren't local are refused (`403`) on a loopback bind, and in LAN mode need the bearer
+  token and may only GET.
 - **Logging:** to stderr (the journal under systemd), one line per POST, per error and per heavy read
   (report, summary, snapshot), with method, path, status and time. The status and live polls aren't
-  logged. Query strings, bodies and config values never are.
+  logged. Query strings, bodies, headers (so the token) and config values never are.
 - **Data:** whoop.db is opened read-only. Syncs and live sessions the API starts run detached, exactly as
   from the TUI. Heavy reads (report, summary, snapshot) run in one worker process, so `/v1/status` and
   `/v1/live` answer immediately while a report builds.
@@ -46,12 +51,50 @@ journalctl --user -u whoop-api -n 20
 
 `whoop-sync.{service,timer}` are independent of it.
 
+## LAN mode
+
+`whoop-poc serve --host 0.0.0.0` (or this machine's LAN address) lets other machines on the network
+read the API; light-training uses it to fetch HR for its sessions. It is off unless you start it so.
+
+- **Token:** `WHOOP_API_TOKEN` (environment, then `~/.config/whoop-poc/env`), at least 24 characters.
+  Without one the server refuses to start. Make one and keep the env file private:
+
+  ```bash
+  python3 -c 'import secrets; print("WHOOP_API_TOKEN=" + secrets.token_urlsafe(32))' >> ~/.config/whoop-poc/env
+  chmod 600 ~/.config/whoop-poc/env
+  ```
+
+- **Requests from other machines** send `Authorization: Bearer <token>`; missing or wrong is `401`
+  (with `WWW-Authenticate: Bearer`). They may only **GET**: a POST (sync, live) is `403`. Requests from
+  this machine to `127.0.0.1` / `localhost` work as before, with no token, so the TUI and the bar widget
+  are unaffected.
+- **Plain HTTP.** The token and HR data cross the Wi-Fi unencrypted. Only use it on a network you trust
+  (home Wi-Fi, WPA2/3), and change the token if it may have leaked.
+- **Firewall.** Open the port to the home subnet only, e.g. with ufw:
+  `sudo ufw allow from 192.168.1.0/24 to any port 8787 proto tcp`.
+- **IPv4 only**; `::` is not supported.
+
+To run the user unit in LAN mode, override its command (`systemctl --user edit whoop-api`):
+
+```ini
+[Service]
+ExecStart=
+ExecStart=%h/.local/bin/whoop-poc serve --host 0.0.0.0
+```
+
+then `systemctl --user restart whoop-api`. Check from another machine:
+
+```bash
+curl -s -H "Authorization: Bearer $WHOOP_API_TOKEN" http://<laptop-ip>:8787/v1/health
+```
+
 ## Conventions
 
 - Paths are versioned under `/v1/`; documents carry a `schema` (`whoop-poc/<name>@<n>`). Within a
   version fields are only ever added (same rule as COACH.md).
 - Responses are compact JSON (`Content-Type: application/json`, `Cache-Control: no-store`).
-- Errors: `{"error": "<message>"}` with `400` (bad query or body), `403` (Host), `404` (no such path),
+- Errors: `{"error": "<message>"}` with `400` (bad query or body), `401` (LAN mode: no or wrong token),
+  `403` (Host; a POST from the LAN), `404` (no such path),
   `405` (wrong method), `409` (the action doesn't apply now, e.g. extending a live session that isn't on),
   `415` (POST without JSON), `500` (something actually broke).
 - Times are unix seconds (`*_unix`). HR is bpm.
@@ -65,6 +108,8 @@ journalctl --user -u whoop-api -n 20
 | `/v1/summary[?since=UNIX]` | the Coach summary, `whoop-poc/snapshot@3` (COACH.md); `/v1/coach` is the same |
 | `/v1/report?hours=N[&bins=N][&series=minute]` | what the TUI window shows |
 | `/v1/live[?session=UNIX&since=UNIX]` | live session state and its samples |
+| `/v1/workouts[?since=UNIX&until=UNIX]` | detected workouts (high-HR periods) with stats and time per zone |
+| `/v1/hr?since=UNIX&until=UNIX` | HR stats and time per zone over any window up to 24 h |
 | `/v1/snapshot?hours=N` | the old per-minute `whoop-poc/snapshot@1` (large; not for widgets) |
 
 ### `/v1/status` (`whoop-poc/status@1`)
@@ -126,6 +171,49 @@ every worn minute's mean instead (`agg: "mean"`, `bins: null`; ~25 KB/day).
 To poll cheaply, pass back `session=<session_start_unix>&since=<newest sample unix you have>`. If the
 session is still that one you get `"full": false` and only the newer samples. Otherwise (a new session)
 you get `"full": true` and all of them.
+
+### `/v1/workouts` (`whoop-poc/workouts@1`)
+
+Workouts as coach and the TUI detect them (1-minute means at or above Z1 for at least 10 minutes,
+merged across gaps under 3 minutes; COACH.md), with confirmations applied, whose start falls in
+`[since, until)`. `until` defaults to now, `since` to `until` − 7 days; the window is at most 31 days.
+Oldest first.
+
+```jsonc
+{"schema": "whoop-poc/workouts@1", "demo": false,
+ "window": {"since_unix", "until_unix"},
+ "newest_unix": …,        // newest history frame in whoop.db
+ "covered": true,         // newest_unix >= until_unix: a later sync won't change this window
+ "workouts": [{"id": "2026-11-13-0733", "start_unix", "end_unix", "duration_min", "detected_min",
+               "confirmed", "avg_hr", "max_hr", "peak_hr_5s", "zone_min", "recovery",
+               "zone_sec": {"Z0": …, "Z1": …, …, "Z5": …}}],   // worn minutes × 60 per zone, all keys
+ "zones": {…}}            // the bounds in use, as in the summary
+```
+
+A workout that started before `since` isn't listed, even if it runs into the window: ask from a little
+before the earliest time you care about.
+
+### `/v1/hr` (`whoop-poc/hr-window@1`)
+
+HR over `[since, until)` (`until` defaults to now, `since` to `until` − 1 h; at most 24 h). For a
+front end that knows when its own session ran and wants the strap's numbers for exactly that span.
+
+```jsonc
+{"schema": "whoop-poc/hr-window@1", "demo": false,
+ "window": {"since_unix", "until_unix"}, "newest_unix": …, "covered": true,
+ "hr": {"stats": {"min", "avg", "max", "rest", "worn_min"} | null,   // over worn 1-minute means
+        "peak_hr_5s": 168 | null, "peak_hr_1s": 172 | null,          // over the per-second readings
+        "zone_sec": {"Z0": …, …, "Z5": …}},
+ "zones": {…}}
+```
+
+`stats` is null when the strap recorded nothing worn in the window. `covered: false` means whoop.db
+hasn't been drained that far yet; ask again after a sync rather than treating the window as empty.
+
+```bash
+curl -s '127.0.0.1:8787/v1/workouts?since=1794436000'
+curl -s '127.0.0.1:8787/v1/hr?since=1794573180&until=1794573780'
+```
 
 ## Actions (POST)
 

@@ -12,7 +12,7 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
   freshness, trends; ~2–3.5 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
   `coach workout <id>` (computed detail: peaks, recovery, drift, intervals). **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
   with per-minute HR; `json --raw` and **serve** also give the per-minute snapshot. The contract is in [COACH.md](COACH.md).
-- **serve**: a local HTTP JSON API on 127.0.0.1 for front ends (the TUI, the Omarchy bar widget): report,
+- **serve**: an HTTP JSON API on 127.0.0.1 (or, with a token, the LAN) for front ends (the TUI, the Omarchy bar widget): report,
   status, live, sync and live actions. See [API.md](API.md); `contrib/systemd/whoop-api.service` runs it.
 
 ## Install (per user, no root)
