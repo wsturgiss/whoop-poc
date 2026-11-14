@@ -83,7 +83,7 @@ const tests = {
     assert.equal(by["Last sleep"], "6h40m  23:00-06:00  95%")
     assert.equal(by["Last workout"], "11-11 08:24-08:46  20m")
     assert.equal(by["Max HR"], "max 190 (default) · peak 182")
-    assert.equal(by["Zones"], "Z1 125 · Z2 138 · Z3 151 · Z4 164 · Z5 177")
+    assert.equal(by["Zones Z1–Z5"], "125/138/151/164/177")
     assert.equal(by["Strap battery"], "68%")
     assert.equal(by["Data age"], "3m")
     assert.ok(rows.some(r => r.value === "avg 157 · max 172 · Z1 2 · Z3 14"))

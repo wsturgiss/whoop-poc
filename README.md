@@ -12,7 +12,7 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
   freshness, trends; ~2–3.5 KB for a week), with small drill-downs: `coach since <unix>`, `coach day <date>`,
   `coach workout <id>` (computed detail: peaks, recovery, drift, intervals). **json** `--out` writes that summary to `coach.json` plus a 30-day daily archive
   with per-minute HR; `json --raw` and **serve** also give the per-minute snapshot. The contract is in [COACH.md](COACH.md).
-- **serve**: a local HTTP JSON API on 127.0.0.1 for front ends (the TUI, a future bar widget): report,
+- **serve**: a local HTTP JSON API on 127.0.0.1 for front ends (the TUI, the Omarchy bar widget): report,
   status, live, sync and live actions. See [API.md](API.md); `contrib/systemd/whoop-api.service` runs it.
 
 ## Install (per user, no root)
@@ -21,7 +21,20 @@ It reads the local SQLite store written by [NOOP](https://github.com/ParthJadhav
 contrib/install.sh --address AA:BB:CC:DD:EE:FF   # whoop-poc + whoop-sync on PATH, sync timer enabled
 ```
 
-See [PLUGIN.md](PLUGIN.md) for what goes where and the plan for an Omarchy bar widget.
+See [PLUGIN.md](PLUGIN.md) for what goes where.
+
+### Omarchy bar widget
+
+On Omarchy, a bar widget (`wsturgiss.whoop`) shows the latest HR and last sleep, with a panel to sync or
+start a live session. It reads only the local API, so run that first:
+
+```bash
+contrib/install.sh --api && systemctl --user enable --now whoop-api
+contrib/omarchy/install.sh               # install/update and enable in the bar (backs up shell.json)
+contrib/omarchy/install.sh --uninstall   # disable and remove (omarchy plugin remove)
+```
+
+Details in [PLUGIN.md](PLUGIN.md#layer-2-the-omarchy-bar-widget-contribomarchywsturgisswhoop).
 
 ## Background sync
 

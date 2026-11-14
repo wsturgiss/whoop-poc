@@ -16,6 +16,8 @@ Panel {
   id: root
   moduleName: "wsturgiss.whoop"
   ipcTarget: "wsturgiss.whoop"
+  // The IPC target is declared below so it can carry sync and refresh.
+  manageIpc: false
 
   readonly property int apiPort: setting("apiPort", 8787)
   readonly property string apiBase: "http://127.0.0.1:" + apiPort
@@ -49,6 +51,8 @@ Panel {
     xhr.onreadystatechange = function() {
       if (xhr.readyState !== XMLHttpRequest.DONE || finished) return
       finished = true
+      // A plugin reload can destroy the watchdog while a request is in flight.
+      if (!watchdog || typeof watchdog.stop !== "function") return
       watchdog.stop()
       var doc = null
       var text = xhr.responseText || ""
@@ -119,6 +123,19 @@ Panel {
     apiRetry.restart()
   }
 
+  // omarchy-shell wsturgiss.whoop <open|close|toggle|sync|refresh>
+  ShellIpc {
+    target: "wsturgiss.whoop"
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function sync(): void { root.startSync() }
+    function refresh(): void { root.pollStatus(); root.fetchSummary(true) }
+  }
+
   RequestWatchdog { id: statusWatchdog; interval: 3000 }
   RequestWatchdog { id: summaryWatchdog; interval: 120000; onTriggered: root.summaryLoading = false }
   RequestWatchdog { id: actionWatchdog; interval: 10000 }
@@ -134,6 +151,7 @@ Panel {
   Timer { id: apiRetry; interval: 1500; onTriggered: root.pollStatus() }
 
   onOpenedChanged: if (opened) { pollStatus(); fetchSummary(true) }
+  onApiUpChanged: if (!actionBusy) actionText = ""
 
   // --- bar ----------------------------------------------------------------
 
@@ -174,7 +192,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: panel.loadedContent
-    contentWidth: panel.fittedContentWidth(Style.space(360))
+    contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(panel.loadedContentHeight)
 
     content: PanelKeyCatcher {
@@ -266,13 +284,14 @@ Panel {
               PlainText {
                 id: rowLabel
                 text: modelData.label
-                width: Style.space(96)
+                visible: modelData.label !== ""
+                width: visible ? Style.space(96) : 0
                 opacity: 0.6
                 font.pixelSize: Style.font.bodySmall
               }
               PlainText {
                 text: modelData.value !== "" ? modelData.value : "—"
-                width: parent.width - rowLabel.width - parent.spacing
+                width: parent.width - (rowLabel.visible ? rowLabel.width + parent.spacing : 0)
                 horizontalAlignment: Text.AlignRight
                 elide: Text.ElideRight
                 font.pixelSize: Style.font.bodySmall

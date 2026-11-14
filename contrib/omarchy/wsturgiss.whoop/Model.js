@@ -109,15 +109,15 @@ function fmtZoneMinutes(zoneMin) {
   return parts.join(" · ")
 }
 
-// "Z1 125 · Z2 138 · …" lower bounds from the summary's zones block.
+// "125/138/151/164/177": Z1–Z5 lower bounds from the summary's zones block.
 function fmtZoneBounds(zones) {
   if (!isObj(zones)) return ""
   var parts = []
   for (var z = 1; z <= 5; z++) {
     var v = num(zones["Z" + z])
-    if (v !== null) parts.push("Z" + z + " " + Math.round(v))
+    if (v !== null) parts.push(String(Math.round(v)))
   }
-  return parts.join(" · ")
+  return parts.join("/")
 }
 
 // What the bar shows.
@@ -241,7 +241,7 @@ function detailRows(status, summary) {
       mv += " · peak " + Math.round(zones.observed_peak.peak_hr_5s)
     }
     rows.push({ label: "Max HR", value: mv })
-    rows.push({ label: "Zones", value: fmtZoneBounds(zones) })
+    rows.push({ label: "Zones Z1–Z5", value: fmtZoneBounds(zones) })
   }
 
   var bat = isObj(status) && isObj(status.battery) ? num(status.battery.pct) : null

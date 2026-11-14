@@ -1,7 +1,7 @@
 # whoop-poc local API
 
-A small HTTP JSON API for whoop-poc front ends: the Textual TUI now, an Omarchy bar widget / overlay
-later. HTTP rather than a unix socket because QML's `XMLHttpRequest` speaks HTTP only.
+A small HTTP JSON API for whoop-poc front ends: the Textual TUI and the Omarchy bar widget
+(`contrib/omarchy/wsturgiss.whoop`, [PLUGIN.md](PLUGIN.md)). HTTP rather than a unix socket because QML's `XMLHttpRequest` speaks HTTP only.
 
 `coach.json` stays the Coach contract ([COACH.md](COACH.md)); `/v1/summary` serves the same document,
 built fresh, as an additional reader.
@@ -168,5 +168,6 @@ In-process results are round-tripped through JSON, so both paths hand the caller
 TUI uses the server only for the configuration the server has: a `--demo`, `--db`, `--address` or
 `--max-hr` run stays in-process. While it talks to the server, its top line ends with `via API :8787`.
 
-A QML widget mirrors steps 1–2 without the fallback: poll `/v1/status` (and `/v1/report?hours=24&bins=<px>`
-less often), and show "whoop-poc API not running" when the connection fails.
+The Omarchy bar widget mirrors steps 1–2 without the fallback: it polls `/v1/status`, fetches
+`/v1/summary` when `status.data.newest_unix` passes the summary's `cursor_unix`, and shows the API as
+not running when the connection fails.
