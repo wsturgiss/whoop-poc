@@ -86,7 +86,34 @@ const tests = {
     assert.equal(by["Zones Z1–Z5"], "125/138/151/164/177")
     assert.equal(by["Strap battery"], "68%")
     assert.equal(by["Data age"], "3m")
-    assert.ok(rows.some(r => r.value === "avg 157 · max 172 · Z1 2 · Z3 14"))
+    assert.ok(rows.some(r => r.value === "avg 157 · max 172"))
+    assert.ok(rows.some(r => r.value === "RHR 60"))
+    const bars = rows.filter(r => r.bar)
+    assert.equal(bars.length, 2)
+    assert.deepEqual([...bars[0].bar.map(b => b.key)], ["deep", "rem", "light", "wake"])
+    assert.deepEqual([...bars[1].bar.map(b => b.text)], ["Z1 125–137 · 2m", "Z3 151–163 · 14m"])
+  },
+  zoneBar() {
+    const zb = M.zoneBar({ Z0: 0, Z1: 2, Z2: 2, Z3: 14, Z4: 4, Z5: 2 }, summary.zones)
+    assert.deepEqual([...zb.map(b => b.key)], ["Z1", "Z2", "Z3", "Z4", "Z5"])
+    assert.equal(zb[3].text, "Z4 164–176 · 4m")
+    assert.equal(zb[4].text, "Z5 177+ · 2m")
+    assert.equal(zb[4].urgent, true)
+    assert.ok(Math.abs(zb.reduce((a, b) => a + b.frac, 0) - 1) < 1e-9)
+    assert.equal(zb[2].frac, 14 / 24)
+    assert.equal(M.zoneBar({ Z0: 5 }, null)[0].text, "Z0 · 5m")
+    assert.equal(M.zoneRange(summary.zones, 0), "Z0 <125")
+    assert.equal(M.zoneBar({}, summary.zones), null)
+    assert.equal(M.zoneBar(null, summary.zones), null)
+    assert.equal(M.zoneBar({ Z3: "x" }, summary.zones), null)
+  },
+  sleepBar() {
+    const sb = M.sleepBar({ wake: 0, rem: 49, light: 378, deep: 0 })
+    assert.deepEqual([...sb.map(b => b.text)], ["Deep 0m", "REM 49m", "Light 6h18m", "Awake 0m"])
+    assert.equal(sb[0].frac, 0)
+    assert.equal(sb[2].frac, 378 / 427)
+    assert.equal(M.sleepBar({ deep: 0, rem: 0, light: 0, wake: 0 }), null)
+    assert.equal(M.sleepBar(undefined), null)
   },
   detailRowsEmpty() {
     const rows = M.detailRows(null, null)

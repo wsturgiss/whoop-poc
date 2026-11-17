@@ -98,17 +98,6 @@ function latestBpm(summary) {
   return isObj(summary) && isObj(summary.latest_hr) ? num(summary.latest_hr.bpm) : null
 }
 
-// "Z1 6 · Z3 14" from {"Z1": 6, "Z3": 14}; zones with no minutes are left out.
-function fmtZoneMinutes(zoneMin) {
-  if (!isObj(zoneMin)) return ""
-  var parts = []
-  for (var z = 0; z <= 5; z++) {
-    var v = num(zoneMin["Z" + z])
-    if (v !== null && v > 0) parts.push("Z" + z + " " + Math.round(v))
-  }
-  return parts.join(" · ")
-}
-
 // "125/138/151/164/177": Z1–Z5 lower bounds from the summary's zones block.
 function fmtZoneBounds(zones) {
   if (!isObj(zones)) return ""
@@ -196,7 +185,74 @@ function syncLine(status) {
   return "Never synced"
 }
 
-// Panel rows: [{label, value}], each value a plain string ("" means "—").
+// Bar segments for the panel's stacked bars: [{key, text, min, frac, shade, urgent}].
+//   frac   - share of the bar's width (0 for a segment that is only in the legend)
+//   shade  - opacity of the foreground colour the segment is drawn in, 0–1
+//   urgent - draw it in the theme's urgent colour instead
+//   text   - its legend entry
+// Returns null when there is nothing to draw.
+function barSegments(parts) {
+  var total = 0
+  parts.forEach(function (p) { total += p.min })
+  if (total <= 0) return null
+  return parts.map(function (p) {
+    return { key: p.key, text: p.text, min: p.min, frac: p.min / total, shade: p.shade, urgent: p.urgent === true }
+  })
+}
+
+// "Z4 164–176" from the summary's zones block (lower bounds Z1–Z5); "Z0 <125",
+// "Z5 177+"; just "Z4" when the bounds are missing.
+function zoneRange(zones, z) {
+  if (!isObj(zones)) return "Z" + z
+  var lo = z === 0 ? null : num(zones["Z" + z])
+  var next = z === 5 ? null : num(zones["Z" + (z + 1)])
+  if (z === 0) return next !== null ? "Z0 <" + Math.round(next) : "Z0"
+  if (lo === null) return "Z" + z
+  if (next === null) return "Z" + z + " " + Math.round(lo) + "+"
+  return "Z" + z + " " + Math.round(lo) + "–" + (Math.round(next) - 1)
+}
+
+var ZONE_SHADES = [0.15, 0.3, 0.45, 0.62, 0.8, 1]
+
+// Time in each HR zone for a workout's zone_min ({"Z1": 2, "Z3": 14}), Z0 to Z5.
+// Zones with no minutes are left out; Z5 is drawn in the urgent colour.
+function zoneBar(zoneMin, zones) {
+  if (!isObj(zoneMin)) return null
+  var parts = []
+  for (var z = 0; z <= 5; z++) {
+    var v = num(zoneMin["Z" + z])
+    if (v === null || v <= 0) continue
+    parts.push({ key: "Z" + z, min: v, shade: ZONE_SHADES[z], urgent: z === 5,
+                 text: zoneRange(zones, z) + " · " + fmtMinutes(v) })
+  }
+  return barSegments(parts)
+}
+
+var SLEEP_STAGES = [
+  { key: "deep", name: "Deep", shade: 1 },
+  { key: "rem", name: "REM", shade: 0.62 },
+  { key: "light", name: "Light", shade: 0.3 },
+  { key: "wake", name: "Awake", shade: 0.8, urgent: true },
+]
+
+// Minutes per sleep stage from a sleep record's stage_min (the NOOP stager's
+// deep/rem/light/wake). Every stage present gets a legend entry, 0 included.
+function sleepBar(stageMin) {
+  if (!isObj(stageMin)) return null
+  var parts = []
+  SLEEP_STAGES.forEach(function (st) {
+    var v = num(stageMin[st.key])
+    if (v === null) return
+    v = Math.max(0, v)
+    parts.push({ key: st.key, min: v, shade: st.shade, urgent: st.urgent === true,
+                 text: st.name + " " + fmtMinutes(v) })
+  })
+  return barSegments(parts)
+}
+
+// Panel rows: [{label, value, bar}], each value a plain string ("" means "—").
+// A row with `bar` (from zoneBar or sleepBar) is drawn as a stacked bar with
+// a legend instead of text.
 function detailRows(status, summary) {
   var rows = []
   var sl = lastSleep(summary)
@@ -205,15 +261,9 @@ function detailRows(status, summary) {
     if (sl.local) v += "  " + str(sl.local)
     if (num(sl.eff_pct) !== null) v += "  " + Math.round(sl.eff_pct) + "%"
     rows.push({ label: "Last sleep", value: v })
-    var st = isObj(sl.stage_min) ? sl.stage_min : null
-    var extra = []
-    if (st) {
-      ["deep", "rem", "light", "wake"].forEach(function (k) {
-        if (num(st[k]) !== null) extra.push(k + " " + Math.round(st[k]))
-      })
-    }
-    if (num(sl.resting_hr) !== null) extra.push("RHR " + Math.round(sl.resting_hr))
-    if (extra.length) rows.push({ label: "", value: extra.join(" · ") })
+    var sb = sleepBar(sl.stage_min)
+    if (sb) rows.push({ label: "", value: "", bar: sb })
+    if (num(sl.resting_hr) !== null) rows.push({ label: "", value: "RHR " + Math.round(sl.resting_hr) })
   } else {
     rows.push({ label: "Last sleep", value: "" })
   }
@@ -226,9 +276,9 @@ function detailRows(status, summary) {
     var we = []
     if (num(w.avg_hr) !== null) we.push("avg " + Math.round(w.avg_hr))
     if (num(w.max_hr) !== null) we.push("max " + Math.round(w.max_hr))
-    var zm = fmtZoneMinutes(w.zone_min)
-    if (zm) we.push(zm)
     if (we.length) rows.push({ label: "", value: we.join(" · ") })
+    var zb = zoneBar(w.zone_min, isObj(summary.zones) ? summary.zones : null)
+    if (zb) rows.push({ label: "", value: "", bar: zb })
   } else {
     rows.push({ label: "Last workout", value: "" })
   }

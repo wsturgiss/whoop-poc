@@ -277,24 +277,41 @@ Panel {
 
           Repeater {
             model: root.rows
-            Row {
+            Item {
+              id: rowItem
               required property var modelData
               width: column.width
-              spacing: Style.space(8)
-              PlainText {
-                id: rowLabel
-                text: modelData.label
-                visible: modelData.label !== ""
-                width: visible ? Style.space(96) : 0
-                opacity: 0.6
-                font.pixelSize: Style.font.bodySmall
+              implicitHeight: modelData.bar ? rowBar.implicitHeight : textRow.implicitHeight
+
+              StackedBar {
+                id: rowBar
+                visible: !!rowItem.modelData.bar
+                width: parent.width
+                segments: rowItem.modelData.bar || []
               }
-              PlainText {
-                text: modelData.value !== "" ? modelData.value : "—"
-                width: parent.width - (rowLabel.visible ? rowLabel.width + parent.spacing : 0)
-                horizontalAlignment: Text.AlignRight
-                elide: Text.ElideRight
-                font.pixelSize: Style.font.bodySmall
+
+
+              Row {
+                id: textRow
+                readonly property var modelData: rowItem.modelData
+                visible: !modelData.bar
+                width: column.width
+                spacing: Style.space(8)
+                PlainText {
+                  id: rowLabel
+                  text: modelData.label
+                  visible: modelData.label !== ""
+                  width: visible ? Style.space(96) : 0
+                  opacity: 0.6
+                  font.pixelSize: Style.font.bodySmall
+                }
+                PlainText {
+                  text: modelData.value !== "" ? modelData.value : "—"
+                  width: parent.width - (rowLabel.visible ? rowLabel.width + parent.spacing : 0)
+                  horizontalAlignment: Text.AlignRight
+                  elide: Text.ElideRight
+                  font.pixelSize: Style.font.bodySmall
+                }
               }
             }
           }
@@ -369,6 +386,81 @@ Panel {
     textFormat: Text.PlainText
     color: root.bar ? root.bar.foreground : Commons.Color.foreground
     font.family: root.bar ? root.bar.fontFamily : Style.font.family
+  }
+
+  // A horizontal stacked bar (segments from Model.zoneBar / Model.sleepBar)
+  // with a wrapping legend of swatches under it.
+  component StackedBar: Column {
+    id: stacked
+    property var segments: []
+    readonly property color fg: root.bar ? root.bar.foreground : Commons.Color.foreground
+    readonly property color hot: root.bar ? root.bar.urgent : Commons.Color.urgent
+    readonly property int gap: 2
+    spacing: Style.space(4)
+    topPadding: Style.space(2)
+    bottomPadding: Style.space(4)
+
+    function segColor(seg) {
+      var c = seg.urgent ? stacked.hot : stacked.fg
+      return Qt.rgba(c.r, c.g, c.b, seg.urgent ? 1 : seg.shade)
+    }
+
+    Rectangle {
+      id: track
+      width: parent.width
+      height: Style.space(8)
+      radius: height / 2
+      color: Qt.rgba(stacked.fg.r, stacked.fg.g, stacked.fg.b, 0.08)
+      clip: true
+
+      Row {
+        id: segRow
+        anchors.fill: parent
+        spacing: stacked.gap
+        // Width left for segments once the gaps between drawn ones are taken out.
+        readonly property real drawable: {
+          var n = 0
+          for (var i = 0; i < stacked.segments.length; i++) if (stacked.segments[i].frac > 0) n++
+          return Math.max(0, track.width - stacked.gap * Math.max(0, n - 1))
+        }
+        Repeater {
+          model: stacked.segments
+          Rectangle {
+            required property var modelData
+            visible: modelData.frac > 0
+            width: segRow.drawable * modelData.frac
+            height: track.height
+            color: stacked.segColor(modelData)
+          }
+        }
+      }
+    }
+
+    Flow {
+      width: parent.width
+      spacing: Style.space(10)
+      Repeater {
+        model: stacked.segments
+        Row {
+          required property var modelData
+          spacing: Style.space(4)
+          Rectangle {
+            width: Style.space(8)
+            height: width
+            radius: 2
+            anchors.verticalCenter: parent.verticalCenter
+            color: stacked.segColor(modelData)
+            border.width: modelData.frac > 0 ? 0 : 1
+            border.color: Qt.rgba(stacked.fg.r, stacked.fg.g, stacked.fg.b, 0.4)
+          }
+          PlainText {
+            text: modelData.text
+            font.pixelSize: Style.font.caption
+            opacity: modelData.frac > 0 ? 0.85 : 0.5
+          }
+        }
+      }
+    }
   }
 
   component ActionButton: Button {

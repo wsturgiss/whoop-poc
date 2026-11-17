@@ -69,8 +69,17 @@ Model.js        pure functions: bar text/state, panel rows, poll interval, when 
   summary's `cursor_unix`, when the panel opens, and at least every 15 min; never more than once a minute
   unless the panel forces it. Requests use QML `XMLHttpRequest` with a watchdog (3 s status, 120 s summary,
   10 s actions); responses over 2 MB are ignored, and all text is drawn as `Text.PlainText`.
-- **Panel** (left click): sync line, live line, last sleep (asleep, window, efficiency, stages, RHR), last
-  workout (time, length, avg/max, zone minutes), max HR and its source, zone bounds, strap battery, data age.
+- **Panel** (left click): sync line, live line, last sleep (asleep, window, efficiency, RHR), last
+  workout (time, length, avg/max), max HR and its source, zone bounds, strap battery, data age.
+  Two stacked bars, each with a legend under it:
+  - last sleep: minutes per stage (deep, REM, light, awake) from the sleep record's `stage_min` (the NOOP
+    stager). Deep is drawn in the full foreground colour, REM and light fainter, awake in the urgent colour.
+    Every stage gets a legend entry, 0 included.
+  - last workout: minutes per HR zone from the workout's `zone_min`. The legend gives each zone's bpm range
+    from the summary's zone bounds (e.g. `Z4 164–176 · 4m`). Z0–Z4 get darker as the zone rises and Z5 is
+    drawn in the urgent colour. Zones with no minutes are left out.
+  Both come from `/v1/summary`; the widget makes no other requests for them (`Model.sleepBar`,
+  `Model.zoneBar`).
   Buttons: Sync (`POST /v1/sync`), Live N m / Stop live (`POST /v1/live/start {"minutes": N}`,
   `/v1/live/stop`), Open TUI. With the API down: Start API (`systemctl --user start whoop-api`) and Open TUI.
   POSTs send `Content-Type: application/json`; Qt sets `Host: 127.0.0.1:<port>` from the URL.
