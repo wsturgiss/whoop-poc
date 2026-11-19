@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -308,3 +309,37 @@ class Client(StateDir):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedConnection(unittest.TestCase):
+    """serve's read-only connection is opened once and still sees rows written after it opened."""
+
+    def test_reuses_connection_and_sees_new_rows(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "whoop.db"
+        writer = sqlite3.connect(db)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE devices (id INTEGER PRIMARY KEY, address TEXT, name TEXT)")
+        writer.execute("CREATE TABLE frames (device_id INTEGER, inner_type INTEGER, unix INTEGER)")
+        writer.execute("INSERT INTO devices VALUES (1, 'AA', 'strap')")
+        writer.execute("INSERT INTO frames VALUES (1, ?, 1000)", (w.TYPE_HISTORICAL,))
+        writer.commit()
+
+        p = mock.patch.object(w, "_SHARED_RO", None)
+        p.start()
+        self.addCleanup(p.stop)
+        w.share_ro_connections()
+        self.addCleanup(lambda: [c.close() for c in w._SHARED_RO.values()])
+        real, opened = sqlite3.connect, []
+        with mock.patch("sqlite3.connect", lambda *a, **k: opened.append(a) or real(*a, **k)):
+            self.assertEqual(w.newest_unix(db), 1000)
+            writer.execute("INSERT INTO frames VALUES (1, ?, 2000)", (w.TYPE_HISTORICAL,))
+            writer.commit()
+            self.assertEqual(w.newest_unix(db), 2000)
+            t = threading.Thread(target=lambda: opened.append(("thread", w.newest_unix(db))))
+            t.start()
+            t.join()
+        self.assertEqual(len(opened), 2)                # one connect, plus the thread's result
+        self.assertEqual(opened[1], ("thread", 2000))

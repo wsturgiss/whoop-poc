@@ -23,7 +23,9 @@ import statistics as st
 import struct
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -131,9 +133,40 @@ def decode_frame(raw: bytes) -> Sample | None:
     return Sample(unix, raw[OFF_HR], gx, gy, gz)
 
 
+_SHARED_RO: dict[str, sqlite3.Connection] | None = None   # None: ro_conn opens a connection per call
+_SHARED_RO_LOCK = threading.Lock()
+
+
+def share_ro_connections() -> None:
+    """Make ro_conn keep one read-only connection per DB file open and reuse it (serve, and its worker).
+    Opening a connection per request rewrites whoop.db-shm each time."""
+    global _SHARED_RO
+    if _SHARED_RO is None:
+        _SHARED_RO = {}
+
+
+@contextmanager
+def ro_conn(db: Path):
+    """A read-only connection to db. Shared (after share_ro_connections): one connection per file, used
+    under a lock, never closed. Its queries run in autocommit, so each one is its own WAL read transaction
+    and sees rows a sync has written since. Otherwise a new connection, closed on exit."""
+    if _SHARED_RO is None:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+    with _SHARED_RO_LOCK:
+        conn = _SHARED_RO.get(str(db))
+        if conn is None:
+            conn = _SHARED_RO[str(db)] = sqlite3.connect(f"file:{db}?mode=ro", uri=True,
+                                                         check_same_thread=False)
+        yield conn
+
+
 def load_samples(db: Path, since: int, until: int, address: str | None = None) -> tuple[list[Sample], dict]:
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    try:
+    with ro_conn(db) as conn:
         dev = conn.execute(
             "SELECT id,address,name FROM devices " + ("WHERE address=? " if address else "")
             + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
@@ -150,8 +183,6 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
                                   "AND end_unix>=? AND start_unix<=?", (dev[0], since, until)).fetchall()
         except sqlite3.OperationalError:
             labels = []
-    finally:
-        conn.close()
     seen, out = set(), []
     for (h,) in rows:
         s = decode_frame(bytes.fromhex(h))
@@ -166,18 +197,13 @@ def load_samples(db: Path, since: int, until: int, address: str | None = None) -
 def newest_unix(db: Path, address: str | None = None) -> int | None:
     """Unix time of the newest history frame in whoop.db (read-only), or None if there is none."""
     try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        with ro_conn(db) as conn:
+            dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
+                               + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
+            return dev and conn.execute("SELECT max(unix) FROM frames WHERE device_id=? AND inner_type=?",
+                                        (dev[0], TYPE_HISTORICAL)).fetchone()[0]
     except sqlite3.Error:
         return None
-    try:
-        dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
-                           + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
-        return dev and conn.execute("SELECT max(unix) FROM frames WHERE device_id=? AND inner_type=?",
-                                    (dev[0], TYPE_HISTORICAL)).fetchone()[0]
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
 
 
 def per_minute(samples: list[Sample]) -> list[Minute]:
@@ -285,39 +311,37 @@ def noop_stage(db: Path, since: int, until: int, address: str | None, mins: list
     None = stager not built / no decoded data (caller falls back to the heuristic)."""
     if not STAGER_BIN.exists():
         return None
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
-                           + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
-        newest = conn.execute("SELECT max(unix) FROM feat_second WHERE device_id=? AND unix BETWEEN ? AND ?",
-                              (dev[0], since, until)).fetchone()[0]
-        if newest is None:
-            return None
-        key = (str(db), dev[0], (until - since) // 60, newest)
-        hit = _STAGE_CACHE.get(key)
-        if hit and time.time() - hit[0] < STAGE_CACHE_S:
-            raw = hit[1]
-        else:
-            sec = conn.execute("SELECT unix,hr,gx,gy,gz,resp_raw FROM feat_second WHERE device_id=? "
-                               "AND unix BETWEEN ? AND ? ORDER BY unix", (dev[0], since, until)).fetchall()
-            rr = conn.execute("SELECT unix,rr_ms FROM feat_rr WHERE device_id=? AND unix BETWEEN ? AND ? "
-                              "ORDER BY unix,idx", (dev[0], since, until)).fetchall()
-            raw = stager_raw({
-                "hr": [{"ts": u, "bpm": h} for u, h, *_ in sec if h],
-                "gravity": [{"ts": u, "x": x, "y": y, "z": z} for u, _, x, y, z, _ in sec if x is not None],
-                "resp": [{"ts": u, "raw": r} for u, *_, r in sec if r is not None],
-                "rr": [{"ts": u, "rrMs": v} for u, v in rr],
-                "tzOffsetSeconds": int(datetime.fromtimestamp(until).astimezone().utcoffset().total_seconds()),
-            })
-            if raw is None:
+        with ro_conn(db) as conn:
+            dev = conn.execute("SELECT id FROM devices " + ("WHERE address=? " if address else "")
+                               + "ORDER BY id LIMIT 1", (address,) if address else ()).fetchone()
+            newest = conn.execute("SELECT max(unix) FROM feat_second WHERE device_id=? AND unix BETWEEN ? AND ?",
+                                  (dev[0], since, until)).fetchone()[0]
+            if newest is None:
                 return None
-            for k in [k for k in _STAGE_CACHE if k[:3] == key[:3]]:     # keep one entry per window size
-                del _STAGE_CACHE[k]
-            _STAGE_CACHE[key] = (time.time(), raw)
+            key = (str(db), dev[0], (until - since) // 60, newest)
+            hit = _STAGE_CACHE.get(key)
+            if hit and time.time() - hit[0] < STAGE_CACHE_S:
+                raw = hit[1]
+            else:
+                sec = conn.execute("SELECT unix,hr,gx,gy,gz,resp_raw FROM feat_second WHERE device_id=? "
+                                   "AND unix BETWEEN ? AND ? ORDER BY unix", (dev[0], since, until)).fetchall()
+                rr = conn.execute("SELECT unix,rr_ms FROM feat_rr WHERE device_id=? AND unix BETWEEN ? AND ? "
+                                  "ORDER BY unix,idx", (dev[0], since, until)).fetchall()
+                raw = stager_raw({
+                    "hr": [{"ts": u, "bpm": h} for u, h, *_ in sec if h],
+                    "gravity": [{"ts": u, "x": x, "y": y, "z": z} for u, _, x, y, z, _ in sec if x is not None],
+                    "resp": [{"ts": u, "raw": r} for u, *_, r in sec if r is not None],
+                    "rr": [{"ts": u, "rrMs": v} for u, v in rr],
+                    "tzOffsetSeconds": int(datetime.fromtimestamp(until).astimezone().utcoffset().total_seconds()),
+                })
+                if raw is None:
+                    return None
+                for k in [k for k in _STAGE_CACHE if k[:3] == key[:3]]:     # keep one entry per window size
+                    del _STAGE_CACHE[k]
+                _STAGE_CACHE[key] = (time.time(), raw)
     except sqlite3.OperationalError:     # NOOP decode never ran on this DB
         return None
-    finally:
-        conn.close()
     return stager_windows(raw, mins, labels)
 
 

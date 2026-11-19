@@ -354,7 +354,9 @@ def serve(args) -> None:
     p = port(args)
     if host not in LOCAL_HOSTS:          # before the worker starts
         raise SystemExit(f"whoop-poc serve binds 127.0.0.1 only; refusing {host!r}")
-    pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+    w.share_ro_connections()
+    pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"),
+                               initializer=w.share_ro_connections)
     try:
         srv = make_server(args, host, p, pool, log=lambda m: print(m, file=sys.stderr, flush=True))
     except OSError as e:

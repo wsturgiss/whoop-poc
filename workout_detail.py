@@ -246,12 +246,10 @@ def lift_sets(samples: list[w.Sample], a: int, b: int) -> dict:
 def load_imu(db: Path, a: int, b: int) -> list[tuple[int, list[float]]]:
     """[(unix, 100 accel magnitudes in g)] from type-43 IMU packets with device time in [a, b). Read-only."""
     try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:   # type-43 rows have no unix column; recv time bounds the query, the packet's own time filters it
-            rows = conn.execute("SELECT hex FROM frames WHERE inner_type=? AND recv_ms BETWEEN ? AND ?",
-                                (IMU_TYPE, (a - 3600) * 1000, (b + 7 * 86400) * 1000)).fetchall()
-        finally:
-            conn.close()
+        with w.ro_conn(db) as conn:   # type-43 rows have no unix column; recv time bounds the query,
+            rows = conn.execute(   # the packet's own time filters it
+                "SELECT hex FROM frames WHERE inner_type=? AND recv_ms BETWEEN ? AND ?",
+                (IMU_TYPE, (a - 3600) * 1000, (b + 7 * 86400) * 1000)).fetchall()
     except sqlite3.DatabaseError:      # no DB or no frames table: no IMU
         return []
     out = {}
