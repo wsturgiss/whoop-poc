@@ -478,10 +478,6 @@ class Client(StateDir):
             self.assertFalse(tui.make_client(SimpleNamespace(**{**base, k: v})).use_api, k)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SharedConnection(unittest.TestCase):
     """serve's read-only connection is opened once and still sees rows written after it opened."""
 
@@ -514,3 +510,7 @@ class SharedConnection(unittest.TestCase):
             t.join()
         self.assertEqual(len(opened), 2)                # one connect, plus the thread's result
         self.assertEqual(opened[1], ("thread", 2000))
+
+
+if __name__ == "__main__":
+    unittest.main()
