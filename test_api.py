@@ -13,9 +13,34 @@ from unittest import mock
 
 import api
 import client
+import coach
 import whoop_poc as w
 
 DEMO = SimpleNamespace(db=Path("/nonexistent"), address=None, demo=True, heuristic=True, days=7)
+REAL = SimpleNamespace(**{**vars(DEMO), "demo": False})
+TOKEN = "t" * 43
+T0 = 1_762_000_000 - 1_762_000_000 % 60     # a minute boundary
+
+
+def trace_samples(*legs, t0=T0):
+    """Per-second samples from legs (seconds, bpm), still wrist."""
+    out, t = [], t0
+    for n, bpm in legs:
+        out += [w.Sample(t + i, bpm, 0.1, -0.4, 0.91) for i in range(n)]
+        t += n
+    return out
+
+
+def fake_build(samples, newest=None):
+    """A w.build_report over synthetic samples; newest_unix (the newest frame in whoop.db) defaults to the
+    last sample's."""
+    def build(db, hours, address, now=None, demo=False, heuristic=False):
+        since = now - int(hours * 3600)
+        ss = [x for x in samples if since <= x.unix <= now + 300]
+        meta = {"address": "AA:BB", "name": "test", "labels": [], "sleep_source": "heuristic",
+                "newest_unix": samples[-1].unix if newest is None else newest}
+        return w.Report(meta, since, now, ss, w.per_minute(ss), [])
+    return build
 
 
 class StateDir(unittest.TestCase):
@@ -28,7 +53,7 @@ class StateDir(unittest.TestCase):
         for p in (mock.patch.object(w, "STATE_DIR", Path(tmp.name)), mock.patch.dict(os.environ, {}, clear=False)):
             p.start()
             self.addCleanup(p.stop)
-        for k in ("WHOOP_MAX_HR", "WHOOP_API_PORT"):
+        for k in ("WHOOP_MAX_HR", "WHOOP_API_PORT", "WHOOP_API_TOKEN"):
             os.environ.pop(k, None)
         w.refresh_max_hr()
 
@@ -109,6 +134,73 @@ class Dispatch(StateDir):
         self.assertEqual((new["full"], new["samples"]), (False, [[102, 62]]))
         other = api.dispatch(cfg, "GET", "/v1/live", {"session": "99", "since": "101"})[1]   # a new session
         self.assertEqual((other["full"], len(other["samples"])), (True, 3))
+
+
+class Windows(StateDir):
+    """/v1/hr and /v1/workouts over a synthetic morning: 30 min easy, 20 min at 150, 30 min easy."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(w, "build_report", fake_build(trace_samples((1800, 70), (1200, 150), (1800, 70))))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def get(self, path, **q):
+        return api.dispatch(REAL, "GET", path, {k: str(v) for k, v in q.items()})
+
+    def test_workouts_lists_the_high_hr_period_with_stats(self):
+        code, doc = self.get("/v1/workouts", since=T0 - 3600, until=T0 + 4700)
+        self.assertEqual(code, 200)
+        self.assertEqual(doc["schema"], "whoop-poc/workouts@1")
+        self.assertEqual(doc["window"], {"since_unix": T0 - 3600, "until_unix": T0 + 4700})
+        self.assertTrue(doc["covered"])
+        (x,) = doc["workouts"]
+        self.assertEqual((x["start_unix"], x["end_unix"], x["duration_min"]), (T0 + 1800, T0 + 3000, 20))
+        self.assertEqual((x["avg_hr"], x["max_hr"], x["peak_hr_5s"]), (150, 150, 150))
+        self.assertEqual(x["id"], coach.workout_id(T0 + 1800))
+        self.assertEqual(x["zone_sec"], {"Z0": 0, "Z1": 0, "Z2": 1200, "Z3": 0, "Z4": 0, "Z5": 0})
+        for k in coach.TUI_WORKOUT_KEYS:
+            self.assertIn(k, x)
+
+    def test_workouts_only_those_starting_in_the_window(self):
+        self.assertEqual(self.get("/v1/workouts", since=T0 + 2000, until=T0 + 4800)[1]["workouts"], [])
+
+    def test_not_covered_until_whoop_db_reaches_the_window_end(self):
+        doc = self.get("/v1/workouts", since=T0, until=T0 + 9000)[1]
+        self.assertFalse(doc["covered"])         # newest sample is T0 + 4799: a later sync may add more
+        self.assertEqual(doc["newest_unix"], T0 + 4799)
+
+    def test_hr_window_stats(self):
+        code, doc = self.get("/v1/hr", since=T0 + 1800, until=T0 + 3000)
+        self.assertEqual(code, 200)
+        self.assertEqual(doc["schema"], "whoop-poc/hr-window@1")
+        self.assertTrue(doc["covered"])
+        hr = doc["hr"]
+        self.assertEqual((hr["stats"]["avg"], hr["stats"]["max"], hr["stats"]["worn_min"]), (150, 150, 20))
+        self.assertEqual((hr["peak_hr_5s"], hr["peak_hr_1s"]), (150, 150))
+        self.assertEqual(hr["zone_sec"]["Z2"], 1200)
+        self.assertEqual(sum(hr["zone_sec"].values()), 1200)
+        wide = self.get("/v1/hr", since=T0, until=T0 + 4800)[1]["hr"]
+        self.assertEqual((wide["zone_sec"]["Z0"], wide["zone_sec"]["Z2"], wide["stats"]["worn_min"]), (3600, 1200, 80))
+
+    def test_hr_window_with_no_data(self):
+        doc = self.get("/v1/hr", since=T0 - 7200, until=T0 - 3600)[1]
+        self.assertIsNone(doc["hr"]["stats"])
+        self.assertIsNone(doc["hr"]["peak_hr_5s"])
+        self.assertTrue(doc["covered"])
+
+    def test_bad_windows(self):
+        for path, q in (("/v1/hr", {"since": T0, "until": T0}), ("/v1/hr", {"since": T0, "until": T0 + 86401}),
+                        ("/v1/hr", {"since": "x"}), ("/v1/workouts", {"since": T0, "until": T0 + 32 * 86400})):
+            code, doc = self.get(path, **q)
+            self.assertEqual(code, 400, (path, q))
+            self.assertIn("error", doc)
+
+    def test_demo_shapes(self):
+        for path in ("/v1/hr", "/v1/workouts"):
+            code, doc = api.dispatch(DEMO, "GET", path)
+            self.assertEqual((code, doc["demo"]), (200, True), path)
+        self.assertTrue(api.is_heavy("GET", "/v1/hr") and api.is_heavy("GET", "/v1/workouts"))
 
 
 class Actions(StateDir):
@@ -244,6 +336,85 @@ def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+class LanMode(StateDir):
+    """make_server in LAN mode with a token, bound to 127.0.0.2 so the tests never listen on a real
+    network. A LAN Host header makes a request non-local the same way a LAN peer does (is_local needs
+    both a loopback peer and a loopback Host)."""
+
+    def start(self, tok=TOKEN):
+        srv = api.make_server(DEMO, "127.0.0.2", 0, tok=tok)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv
+
+    def call(self, srv, method, path, body=None, headers=None):
+        req = urllib.request.Request(f"http://127.0.0.2:{srv.server_port}{path}", method=method, data=body,
+                                     headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def lan(self, srv, auth=None):
+        h = {"Host": f"192.168.1.20:{srv.server_port}"}
+        if auth:
+            h["Authorization"] = auth
+        return h
+
+    def test_needs_a_long_enough_token(self):
+        self.assertRaises(SystemExit, api.make_server, DEMO, "0.0.0.0", 0)
+        self.assertRaises(SystemExit, api.make_server, DEMO, "0.0.0.0", 0, tok="short")
+        os.environ["WHOOP_API_TOKEN"] = "short"
+        self.assertRaises(SystemExit, api.serve, SimpleNamespace(**vars(DEMO), host="0.0.0.0", port=0))
+        self.assertEqual(self.start().server_address[0], "127.0.0.2")
+
+    def test_lan_requests_need_the_bearer_token(self):
+        srv = self.start()
+        code, _ = self.call(srv, "GET", "/healthz", headers=self.lan(srv))
+        self.assertEqual(code, 401)
+        req = urllib.request.Request(f"http://127.0.0.2:{srv.server_port}/healthz", headers=self.lan(srv))
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(e.exception.headers["WWW-Authenticate"], 'Bearer realm="whoop-poc"')
+        for bad in ("Bearer " + "u" * 43, TOKEN, "Basic " + TOKEN, "Bearer"):
+            self.assertEqual(self.call(srv, "GET", "/healthz", headers=self.lan(srv, bad))[0], 401, bad)
+        code, body = self.call(srv, "GET", "/healthz", headers=self.lan(srv, "Bearer " + TOKEN))
+        self.assertEqual((code, json.loads(body)), (200, {"ok": True, "demo": True}))
+        self.assertEqual(self.call(srv, "GET", "/v1/workouts", headers=self.lan(srv, "bearer " + TOKEN))[0], 200)
+
+    def test_lan_can_only_get(self):
+        srv = self.start()
+        h = {**self.lan(srv, "Bearer " + TOKEN), "Content-Type": "application/json"}
+        with mock.patch.object(w, "stop_live", return_value=False) as stop:
+            self.assertEqual(self.call(srv, "POST", "/v1/live/stop", b"{}", h)[0], 403)
+        stop.assert_not_called()
+
+    def test_local_requests_need_no_token(self):
+        srv = self.start()
+        local = {"Host": f"127.0.0.1:{srv.server_port}"}
+        self.assertEqual(self.call(srv, "GET", "/healthz", headers=local)[0], 200)
+        with mock.patch.object(w, "stop_live", return_value=False):
+            h = {**local, "Content-Type": "application/json"}
+            self.assertEqual(self.call(srv, "POST", "/v1/live/stop", b"{}", h)[0], 200)
+
+    def test_is_local_needs_a_loopback_peer_and_host(self):
+        self.assertTrue(api.is_local("127.0.0.1", "localhost"))
+        self.assertTrue(api.is_local("::1", "127.0.0.1"))
+        self.assertFalse(api.is_local("192.168.1.20", "localhost"))     # a LAN peer naming localhost
+        self.assertFalse(api.is_local("127.0.0.1", "evil.example"))      # DNS rebinding
+        self.assertFalse(api.is_local("not-an-ip", "localhost"))
+
+    def test_loopback_bind_ignores_tokens(self):
+        srv = api.make_server(DEMO, "127.0.0.1", 0, tok=TOKEN)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        h = {"Host": "evil.example", "Authorization": "Bearer " + TOKEN}
+        self.assertEqual(Server.call(self, srv, "GET", "/healthz", headers=h)[0], 403)
 
 
 class Client(StateDir):
